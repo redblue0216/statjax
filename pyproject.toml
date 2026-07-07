@@ -1,0 +1,67 @@
+[build-system]
+requires = ["setuptools>=75.0", "wheel", "build"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "statjax"
+version = "0.1.1"
+description = "StatJAX - A statistical model algorithm package based on the JAX technology stack"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+requires-python = ">=3.10"
+authors = [
+    {name = "shihua", email = "15021408795@163.com"}
+]
+keywords = ["jax", "statistics", "machine-learning", "gpu"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Mathematics",
+]
+
+dependencies = [
+    "jax>=0.4.0",
+    "jaxlib>=0.4.0",
+    "numpy>=1.24.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "black>=24.0",
+    "ruff>=0.6.0",
+    "mypy>=1.10",
+]
+
+[project.urls]
+Homepage = "https://github.com/redblue0216/statjax"
+Documentation = "https://github.com/redblue0216/statjax/blob/main/README.md"
+Repository = "https://github.com/redblue0216/statjax"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["statjax*"]
+exclude = ["*.__pycache__"]
+
+[tool.setuptools.package-data]
+statjax = ["tests/**/*"]
+
+[tool.black]
+line-length = 100
+target-version = ['py310']
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false

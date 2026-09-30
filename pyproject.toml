@@ -1,13 +1,13 @@
 [build-system]
-requires = ["setuptools>=75.0", "wheel", "build"]
+requires = ["setuptools>=77.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "statjax"
-version = "0.1.1"
+version = "0.2.0"
 description = "StatJAX - A statistical model algorithm package based on the JAX technology stack"
 readme = "README.md"
-license = {text = "Apache-2.0"}
+license = "Apache-2.0"
 requires-python = ">=3.10"
 authors = [
     {name = "shihua", email = "15021408795@163.com"}
@@ -16,7 +16,6 @@ keywords = ["jax", "statistics", "machine-learning", "gpu"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
@@ -51,6 +50,9 @@ exclude = ["*.__pycache__"]
 
 [tool.setuptools.package-data]
 statjax = ["tests/**/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["statjax/tests"]
 
 [tool.black]
 line-length = 100

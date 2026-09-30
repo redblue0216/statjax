@@ -12,32 +12,38 @@
 Module Introduction
 -------------------
 
-This is a basic class collection of dynamic management methods
+This is a collection of algorithm auxiliary utility classes
 
 - Design mode:
 
-    (1) Combination mode
+    (1) Mixin mode
 
 - Key points:
 
-    (1) Metaprogramming technology init subclass
+    (1) Mixin mode and static methods
 
 - Main functions:
 
-    (1) Dynamic loading method
+    (1) Algorithm auxiliary functions that can be called directly
 
 Usage examples
 --------------
 .. code-block:: python
     :linenos:
 
+    from statjax.utils import MixinUtils
+
+    ### Static methods of the Mixin utility class can be called directly without instantiation
+    MixinUtils.func_a()
+    MixinUtils.func_b()
+
 Class Description
 -----------------
-(1)MetaRequestMethod: This is a dynamic management class method, the main function dynamic loading method, the main technical metaprogramming technology
+(1)MixinUtils: This is the concrete implementation of algorithm auxiliary functions, the main technical Mixin mode and static methods
 
 References
 ----------
-PythonORG `"Python datamodel"<https://docs.python.org/3/reference/datamodel.html#object.__init_subclass__>`_
+StatJAX Design Document `"StatJAX Design SH V001"<https://github.com/redblue0216/statjax>`_
 '''
 
 
@@ -55,8 +61,8 @@ PythonORG `"Python datamodel"<https://docs.python.org/3/reference/datamodel.html
 
 ####### Classes and Functions #######################################################################
 ###
-### class:MetaRequestMethod
-### ------This is a dynamic management class method, the main function dynamic loading method, the main technical metaprogramming technology
+### class:MixinUtils
+### ------This is the concrete implementation of algorithm auxiliary functions, the main technical Mixin mode and static methods
 ###
 ######################################################################################################
 
@@ -68,14 +74,40 @@ PythonORG `"Python datamodel"<https://docs.python.org/3/reference/datamodel.html
 
 
 class MixinUtils(object):
+    '''Class Introduction:
+
+        This is the concrete implementation of algorithm auxiliary functions, the main technical Mixin mode and static methods. As a Mixin auxiliary class, it can be mixed into various algorithm components to provide directly callable algorithm auxiliary functions
+    '''
 
 
     @staticmethod
     def func_a():
+        '''Method Function:
+
+            Define an algorithm auxiliary function a, the main technical static method, which can be called directly without instantiation
+
+        :parameters:
+            nothing
+
+        :return:
+            nothing
+        '''
+
         print("This is func_a from MixinUtils")
 
     @staticmethod
     def func_b():
+        '''Method Function:
+
+            Define an algorithm auxiliary function b, the main technical static method, which can be called directly without instantiation
+
+        :parameters:
+            nothing
+
+        :return:
+            nothing
+        '''
+
         print("This is func_b from MixinUtils")
 
 

@@ -12,33 +12,48 @@
 Module Introduction
 -------------------
 
-This is a collection of postprocessing base classes
+This is a collection of regression base classes
 
 - Design mode:
 
-    (1) nothing
+    (1) Abstract base class mode
 
 - Key points:
 
-    (1) nothing
+    (1) Metaprogramming technology init subclass
+
+    (2) ABC abstract method
 
 - Main functions:
 
-    (1) Post-processing
+    (1) Standardize the unified interface methods of regression algorithm modules, including three methods: training, inference, and meta information
 
 Usage examples
 --------------
 .. code-block:: python
     :linenos:
 
+    from statjax.regression._base import BaseRegression
+
+    ### Define a regression component that inherits the regression base class and implements the agreed abstract methods
+    class XXXXRegressionComponent(BaseRegression):
+
+        def train(self):
+            return "train implemented"
+
+        def reasoning(self):
+            return "reasoning implemented"
+
+        def _info(self):
+            return "component info"
 
 Class Description
 -----------------
-(1)BasePostprocessing: This is a basic class of algorithm modules. Its main functions standardize the unified interface method of specific algorithm modules, including three methods: training, inference, and direct operation
+(1)BaseRegression: This is a basic class of regression algorithm modules. Its main functions standardize the unified interface method of specific algorithm modules, including three methods: training, inference, and meta information
 
 References
 ----------
-
+StatJAX Design Document `"StatJAX Design SH V001"<https://github.com/redblue0216/statjax>`_
 '''
 
 
@@ -58,8 +73,8 @@ from abc import ABC,abstractmethod
 
 ####### Classes and Functions ###################################################################################################################################################
 ###
-### class:BasePostprocessing
-### ------This is a basic class of algorithm modules. Its main functions standardize the unified interface method of specific algorithm modules, including three methods: training, inference, and direct operation
+### class:BaseRegression
+### ------This is a basic class of regression algorithm modules. Its main functions standardize the unified interface method of specific algorithm modules, including three methods: training, inference, and meta information
 ###
 ################################################################################################################################################################################
 
@@ -73,14 +88,14 @@ from abc import ABC,abstractmethod
 class BaseRegression(ABC,metaclass=MetaRequestMethod):
     '''Class Introduction:
 
-        This is a basic class of algorithm modules. Its main functions standardize the unified interface method of specific algorithm modules, including three methods: training, inference, and direct operation
+        This is a basic class of regression algorithm modules. Its main functions standardize the unified interface method of specific algorithm modules, including three methods: training, inference, and meta information. It uses the MetaRequestMethod metaclass to check whether the subclass implements all agreed abstract methods before the class is created
     '''
 
     @abstractmethod
     def train(self):
         '''Method Function:
 
-            Defines an abstract method for training methods
+            Defines an abstract method for training methods. The regression component subclass must implement the agreed training behavior, otherwise a NotImplementedError is raised when the class is created
 
         :parameters:
             nothing
@@ -96,7 +111,7 @@ class BaseRegression(ABC,metaclass=MetaRequestMethod):
     def reasoning(self):
         '''Method Function:
 
-            Defines an abstract method of inference method
+            Defines an abstract method of inference method. The regression component subclass must implement the agreed inference behavior, otherwise a NotImplementedError is raised when the class is created
 
         :parameters:
             nothing
@@ -111,7 +126,7 @@ class BaseRegression(ABC,metaclass=MetaRequestMethod):
     def _info(self):
         '''Method Function:
 
-            Define an internal method to obtain basic meta information
+            Define an internal method to obtain basic meta information, the main function is to return the text introduction of the algorithm module
 
         :parameters:
             nothing

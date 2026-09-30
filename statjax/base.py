@@ -22,6 +22,8 @@ This is a basic class collection of dynamic management methods
 
     (1) Metaprogramming technology init subclass
 
+    (2) Before the class is created, check whether the methods and attributes coded by the class meet the requirements
+
 - Main functions:
 
     (1) Dynamic loading method
@@ -30,6 +32,22 @@ Usage examples
 --------------
 .. code-block:: python
     :linenos:
+
+    from abc import ABC,abstractmethod
+    from statjax.base import MetaRequestMethod
+
+    ### Define a module base class that uses the metaclass and agrees on abstract method behavior
+    class BaseXXXX(ABC,metaclass=MetaRequestMethod):
+
+        @abstractmethod
+        def xxxx(self):
+            pass
+
+    ### Define an algorithm component that inherits the module base class. If the abstract method is not implemented, a NotImplementedError is raised when the class is created
+    class XXXXComponent(BaseXXXX):
+
+        def xxxx(self):
+            return "implemented"
 
 Class Description
 -----------------

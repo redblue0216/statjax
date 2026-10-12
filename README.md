@@ -80,6 +80,18 @@ python -m pytest -v
 
 For the complete self-test process from scratch, see [StatJAX自我测试完整流程_SH_V001.md](design/StatJAX自我测试完整流程_SH_V001.md).
 
+### 3.3 design
+<details>
+<summary>Click to view design documents (4 files)</summary>
+
+| File | Description |
+|:----|:----|
+| [StatJAX设计_SH_V001.md](design/StatJAX设计_SH_V001.md) | Overall design of StatJAX: core concepts (base / component / algo) and the framework architecture |
+| [StatJAX001_实施方案_SH_V001.md](design/StatJAX001_实施方案_SH_V001.md) | Implementation plan for the StatJAX001 iteration |
+| [StatJAX001_OLS_SH_V003.md](design/StatJAX001_OLS_SH_V003.md) | OLS algorithm document: Householder QR decomposition for ordinary least squares |
+| [StatJAX自我测试完整流程_SH_V001.md](design/StatJAX自我测试完整流程_SH_V001.md) | Complete self-test process of StatJAX from scratch |
+</details>
+
 ## 4.algorithm
 ### 4.1 Which algorithms and models are covered?
 

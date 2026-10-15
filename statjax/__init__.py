@@ -133,13 +133,13 @@ def _read_version() -> str:
         text = pyproject.read_text(encoding='utf-8')
         import re as _re
         m = _re.search(r'^version\s*=\s*"([^"]+)"', text, _re.M)
-        return m.group(1) if m else '0.2.0'
+        return m.group(1) if m else '0.2.1'
     except Exception:
         pass
     try:
         return _im.version('statjax')
     except Exception:
-        return '0.2.0'
+        return '0.2.1'
 
 
 

@@ -57,7 +57,7 @@ python build.py --clean --install
 ```python
 import jax
 import jax.numpy as jnp
-from statjax.regression import HouseholderOLSComponent
+from statjax.regression import HouseholderOLSComponent, SVDRidgeComponent
 
 # Prepare the training data (column full rank design matrix A and observation labels b)
 A_train = jax.random.normal(jax.random.PRNGKey(0), (100, 5))
@@ -69,6 +69,18 @@ x_hat, metrics = ols.train(A=A_train, b=b_train)
 
 # Batch prediction on the test set
 y_pred = ols.reasoning(A_test=A_train)
+
+# Train the ridge regression model with L2 regularization coefficient lambda
+ridge = SVDRidgeComponent(lam=1.0)
+w_hat, metrics = ridge.train(A=A_train, b=b_train)
+y_pred = ridge.reasoning(A_test=A_train)
+```
+
+Runnable end-to-end demos:
+
+```bash
+python example/example_001.py   # OLS (Householder QR)
+python example/example_002.py   # Ridge regression (SVD)
 ```
 
 Run unit tests:
@@ -78,18 +90,20 @@ pip install pytest
 python -m pytest -v
 ```
 
-For the complete self-test process from scratch, see [StatJAX自我测试完整流程_SH_V001.md](design/StatJAX自我测试完整流程_SH_V001.md).
+For the complete self-test process from scratch, see [StatJAX自我测试完整流程_SH_V002.md](design/StatJAX自我测试完整流程_SH_V002.md).
 
 ### 3.3 design
 <details>
-<summary>Click to view design documents (4 files)</summary>
+<summary>Click to view design documents (6 files)</summary>
 
 | File | Description |
 |:----|:----|
 | [StatJAX设计_SH_V001.md](design/StatJAX设计_SH_V001.md) | Overall design of StatJAX: core concepts (base / component / algo) and the framework architecture |
 | [StatJAX001_实施方案_SH_V001.md](design/StatJAX001_实施方案_SH_V001.md) | Implementation plan for the StatJAX001 iteration |
 | [StatJAX001_OLS_SH_V003.md](design/StatJAX001_OLS_SH_V003.md) | OLS algorithm document: Householder QR decomposition for ordinary least squares |
-| [StatJAX自我测试完整流程_SH_V001.md](design/StatJAX自我测试完整流程_SH_V001.md) | Complete self-test process of StatJAX from scratch |
+| [StatJAX002_实施方案_SH_V001.md](design/StatJAX002_实施方案_SH_V001.md) | Implementation plan for the StatJAX002 iteration |
+| [StatJAX002_岭回归_SH_V002.md](design/StatJAX002_岭回归_SH_V002.md) | Ridge regression algorithm document: SVD-based ridge regression |
+| [StatJAX自我测试完整流程_SH_V002.md](design/StatJAX自我测试完整流程_SH_V002.md) | Complete self-test process of StatJAX from scratch |
 </details>
 
 ## 4.algorithm
@@ -98,10 +112,16 @@ For the complete self-test process from scratch, see [StatJAX自我测试完整�
 | Module | Component | Algorithm | Key features |
 |:----|:----|:----|:----|
 | regression | HouseholderOLSComponent | Ordinary least squares (OLS) solved by Householder QR decomposition: min ‖A·x − b‖₂², equivalently transformed into R·x̂ = Qᵀ·b | Optimal numerical stability (no condition number squaring); fully differentiable, JIT-compilable and GPU-accelerated based on JAX |
+| regression | SVDRidgeComponent | Ridge regression solved by SVD decomposition: min ‖X·w − y‖₂² + λ·‖w‖₂², reduced to per-singular-component shrinkage ŵ = V·diag(σᵢ/(σᵢ²+λ))·Uᵀ·y | Natively carries L2 regularization; numerically stable under multicollinearity and rank deficiency; fully differentiable, JIT-compilable and GPU-accelerated based on JAX |
 
 ## 5.ChangeLog
 <details>
 <summary>Click to view ChangeLog</summary>
+
+### Version-0.2.1
+  - Added the regression component SVDRidgeComponent (ridge regression based on SVD decomposition)
+  - Added the unit test file statjax/tests/test_ridge.py
+  - Deepened project-wide comments, integrating the ridge regression algorithm document (StatJAX002)
 
 ### Version-0.2.0
   - Added the regression component HouseholderOLSComponent (OLS linear regression based on Householder QR decomposition)

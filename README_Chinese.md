@@ -57,7 +57,7 @@ python build.py --clean --install
 ```python
 import jax
 import jax.numpy as jnp
-from statjax.regression import HouseholderOLSComponent
+from statjax.regression import HouseholderOLSComponent, SVDRidgeComponent
 
 # 准备训练数据（列满秩设计矩阵A与观测标签b）
 A_train = jax.random.normal(jax.random.PRNGKey(0), (100, 5))
@@ -69,6 +69,18 @@ x_hat, metrics = ols.train(A=A_train, b=b_train)
 
 # 测试集批量预测
 y_pred = ols.reasoning(A_test=A_train)
+
+# 训练岭回归模型，lambda为L2正则系数
+ridge = SVDRidgeComponent(lam=1.0)
+w_hat, metrics = ridge.train(A=A_train, b=b_train)
+y_pred = ridge.reasoning(A_test=A_train)
+```
+
+可运行的端到端演示：
+
+```bash
+python example/example_001.py   # OLS（Householder QR）
+python example/example_002.py   # 岭回归（SVD）
 ```
 
 运行单元测试：
@@ -78,18 +90,20 @@ pip install pytest
 python -m pytest -v
 ```
 
-从零开始的完整自我测试流程见 [StatJAX自我测试完整流程_SH_V001.md](design/StatJAX自我测试完整流程_SH_V001.md)。
+从零开始的完整自我测试流程见 [StatJAX自我测试完整流程_SH_V002.md](design/StatJAX自我测试完整流程_SH_V002.md)。
 
 ### 3.3 设计
 <details>
-<summary>点击查看设计文档（共4份）</summary>
+<summary>点击查看设计文档（共6份）</summary>
 
 | 文件 | 说明 |
 |:----|:----|
 | [StatJAX设计_SH_V001.md](design/StatJAX设计_SH_V001.md) | StatJAX总体设计：核心概念（base / component / algo）与框架架构 |
 | [StatJAX001_实施方案_SH_V001.md](design/StatJAX001_实施方案_SH_V001.md) | StatJAX001迭代的实施方案 |
 | [StatJAX001_OLS_SH_V003.md](design/StatJAX001_OLS_SH_V003.md) | OLS算法文档：基于Householder QR分解求解普通最小二乘 |
-| [StatJAX自我测试完整流程_SH_V001.md](design/StatJAX自我测试完整流程_SH_V001.md) | StatJAX从零开始的完整自我测试流程 |
+| [StatJAX002_实施方案_SH_V001.md](design/StatJAX002_实施方案_SH_V001.md) | StatJAX002迭代的实施方案 |
+| [StatJAX002_岭回归_SH_V002.md](design/StatJAX002_岭回归_SH_V002.md) | 岭回归算法文档：基于SVD分解求解岭回归 |
+| [StatJAX自我测试完整流程_SH_V002.md](design/StatJAX自我测试完整流程_SH_V002.md) | StatJAX从零开始的完整自我测试流程 |
 </details>
 
 ## 4.算法
@@ -98,10 +112,16 @@ python -m pytest -v
 | 模块 | 组件 | 算法 | 关键特性 |
 |:----|:----|:----|:----|
 | regression | HouseholderOLSComponent | 基于Householder QR分解求解普通最小二乘（OLS）：min ‖A·x − b‖₂²，等价转化为 R·x̂ = Qᵀ·b | 数值稳定性最优（不放大条件数）；基于JAX全程可微、可JIT编译、可GPU加速 |
+| regression | SVDRidgeComponent | 基于SVD分解求解岭回归：min ‖X·w − y‖₂² + λ·‖w‖₂²，化为逐奇异分量压缩 ŵ = V·diag(σᵢ/(σᵢ²+λ))·Uᵀ·y | 原生承载L2正则；多重共线性与秩亏下数值稳定；基于JAX全程可微、可JIT编译、可GPU加速 |
 
 ## 5.ChangeLog
 <details>
 <summary>点击查看ChangeLog</summary>
+
+### Version-0.2.1
+  - 新增回归组件SVDRidgeComponent（基于SVD分解的岭回归）
+  - 新增单元测试文件statjax/tests/test_ridge.py
+  - 深化全项目注释，整合岭回归算法文档（StatJAX002）内容
 
 ### Version-0.2.0
   - 新增回归组件HouseholderOLSComponent（基于Householder QR分解的OLS线性回归）

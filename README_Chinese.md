@@ -57,7 +57,7 @@ python build.py --clean --install
 ```python
 import jax
 import jax.numpy as jnp
-from statjax.regression import HouseholderOLSComponent, SVDRidgeComponent
+from statjax.regression import HouseholderOLSComponent, SVDRidgeComponent, CDLassoComponent
 
 # 准备训练数据（列满秩设计矩阵A与观测标签b）
 A_train = jax.random.normal(jax.random.PRNGKey(0), (100, 5))
@@ -74,6 +74,11 @@ y_pred = ols.reasoning(A_test=A_train)
 ridge = SVDRidgeComponent(lam=1.0)
 w_hat, metrics = ridge.train(A=A_train, b=b_train)
 y_pred = ridge.reasoning(A_test=A_train)
+
+# 训练LASSO回归模型，lambda为L1正则系数
+lasso = CDLassoComponent(lam=0.01)
+w_hat, metrics = lasso.train(A=A_train, b=b_train)
+y_pred = lasso.reasoning(A_test=A_train)
 ```
 
 可运行的端到端演示：
@@ -81,6 +86,7 @@ y_pred = ridge.reasoning(A_test=A_train)
 ```bash
 python example/example_001.py   # OLS（Householder QR）
 python example/example_002.py   # 岭回归（SVD）
+python example/example_003.py   # LASSO（坐标下降）
 ```
 
 运行单元测试：
@@ -90,11 +96,11 @@ pip install pytest
 python -m pytest -v
 ```
 
-从零开始的完整自我测试流程见 [StatJAX自我测试完整流程_SH_V002.md](design/StatJAX自我测试完整流程_SH_V002.md)。
+从零开始的完整自我测试流程见 [StatJAX自我测试完整流程_SH_V003.md](design/StatJAX自我测试完整流程_SH_V003.md)。
 
 ### 3.3 设计
 <details>
-<summary>点击查看设计文档（共6份）</summary>
+<summary>点击查看设计文档（共9份）</summary>
 
 | 文件 | 说明 |
 |:----|:----|
@@ -103,7 +109,10 @@ python -m pytest -v
 | [StatJAX001_OLS_SH_V003.md](design/StatJAX001_OLS_SH_V003.md) | OLS算法文档：基于Householder QR分解求解普通最小二乘 |
 | [StatJAX002_实施方案_SH_V001.md](design/StatJAX002_实施方案_SH_V001.md) | StatJAX002迭代的实施方案 |
 | [StatJAX002_岭回归_SH_V002.md](design/StatJAX002_岭回归_SH_V002.md) | 岭回归算法文档：基于SVD分解求解岭回归 |
-| [StatJAX自我测试完整流程_SH_V002.md](design/StatJAX自我测试完整流程_SH_V002.md) | StatJAX从零开始的完整自我测试流程 |
+| [StatJAX003_实施方案_SH_V001.md](design/StatJAX003_实施方案_SH_V001.md) | StatJAX003迭代的实施方案 |
+| [StatJAX003_LASSO_SH_V001.md](design/StatJAX003_LASSO_SH_V001.md) | LASSO算法文档：基于坐标下降法求解L1正则回归 |
+| [StatJAX自我测试完整流程_SH_V002.md](design/StatJAX自我测试完整流程_SH_V002.md) | StatJAX从零开始的完整自我测试流程（适用于statjax 0.2.1） |
+| [StatJAX自我测试完整流程_SH_V003.md](design/StatJAX自我测试完整流程_SH_V003.md) | StatJAX从零开始的完整自我测试流程（适用于statjax 0.3.1） |
 </details>
 
 ## 4.算法
@@ -113,10 +122,17 @@ python -m pytest -v
 |:----|:----|:----|:----|
 | regression | HouseholderOLSComponent | 基于Householder QR分解求解普通最小二乘（OLS）：min ‖A·x − b‖₂²，等价转化为 R·x̂ = Qᵀ·b | 数值稳定性最优（不放大条件数）；基于JAX全程可微、可JIT编译、可GPU加速 |
 | regression | SVDRidgeComponent | 基于SVD分解求解岭回归：min ‖X·w − y‖₂² + λ·‖w‖₂²，化为逐奇异分量压缩 ŵ = V·diag(σᵢ/(σᵢ²+λ))·Uᵀ·y | 原生承载L2正则；多重共线性与秩亏下数值稳定；基于JAX全程可微、可JIT编译、可GPU加速 |
+| regression | CDLassoComponent | 基于坐标下降法求解LASSO：min ½‖y − X·β‖₂² + λ·‖β‖₁，逐坐标精确最小化（软阈值算子 β_j = soft(z_j, λ)/s_j + 秩-1残差更新） | L1精确稀疏解，直接实现特征选择；无需矩阵分解，高维友好；KKT最优性校验（JAX原生）；基于JAX全程可微、可JIT编译、可GPU加速 |
 
 ## 5.ChangeLog
 <details>
 <summary>点击查看ChangeLog</summary>
+
+### Version-0.3.1
+  - 新增回归组件CDLassoComponent（基于坐标下降法的LASSO回归）
+  - 新增单元测试文件statjax/tests/test_lasso.py
+  - 深化全项目注释，整合LASSO算法文档（StatJAX003）内容
+  - 自我测试流程文档更新为《StatJAX自我测试完整流程_SH_V003.md》
 
 ### Version-0.2.1
   - 新增回归组件SVDRidgeComponent（基于SVD分解的岭回归）

@@ -12,7 +12,7 @@
 Module Introduction
 -------------------
 
-This is a collection of regression concrete implementation classes
+This is a collection of concrete regression and binary-classification implementation classes. Each algorithm is mounted as an independent Component under BaseRegression, preserving the overall Base / Component / Algo architecture
 
 - Design mode:
 
@@ -20,18 +20,20 @@ This is a collection of regression concrete implementation classes
 
 - Key points:
 
-    (1) JAX technology stack (thin QR decomposition, triangular back substitution, thin SVD decomposition, singular value shrinkage, soft thresholding operator, Gauss-Seidel coordinate sweep, rank-1 residual update, JIT compilation)
+    (1) JAX technology stack (thin QR decomposition, triangular back substitution, thin SVD decomposition, singular value shrinkage, soft thresholding operator, Gauss-Seidel coordinate sweep, rank-1 residual update, IRLS, column-pivoted QR, Armijo backtracking, JIT compilation where shapes permit)
 
 - Main functions:
 
-    (1) Regression
+    (1) Linear regression, regularized regression and sparse regression
+
+    (2) Binary Logistic probability inference and classification
 
 Usage examples
 --------------
 .. code-block:: python
     :linenos:
 
-    from statjax.regression import HouseholderOLSComponent,SVDRidgeComponent,CDLassoComponent
+    from statjax.regression import HouseholderOLSComponent,SVDRidgeComponent,CDLassoComponent,QRLogisticComponent
 
     ### Train the OLS model and solve the optimal regression coefficients
     ols_instance = HouseholderOLSComponent()
@@ -51,6 +53,13 @@ Usage examples
     ### Batch prediction on the test set (the intercept is automatically added back)
     y_pred = lasso_instance.reasoning(A_test=A_test)
 
+    ### Train binary Logistic regression on labels containing only 0 and 1
+    logistic_instance = QRLogisticComponent(l2=1e-6)
+    beta_hat,metrics = logistic_instance.train(A=A_binary_train,b=b_binary_train)
+    ### Return [P(y=0|x),P(y=1|x)] and threshold-based binary classes
+    probabilities = logistic_instance.predict_proba(A_test=A_binary_test)
+    y_pred = logistic_instance.reasoning(A_test=A_binary_test)
+
 Class Description
 -----------------
 (1)TestRegression: This is a regression test placeholder component implementation class, the main function is to verify the framework link, the main technical inheritance
@@ -60,6 +69,8 @@ Class Description
 (3)SVDRidgeComponent: This is a ridge regression component implementation class based on SVD decomposition, the main function is to solve the L2 regularized optimal regression coefficients and batch prediction, the main technical JAX technology stack (thin SVD decomposition, singular value shrinkage, JIT compilation)
 
 (4)CDLassoComponent: This is a LASSO regression component implementation class based on coordinate descent, the main function is to solve the L1 regularized sparse optimal regression coefficients and batch prediction, the main technical JAX technology stack (soft thresholding operator, Gauss-Seidel coordinate sweep, rank-1 residual update, lax.fori_loop compiled control flow, JIT compilation)
+
+(5)QRLogisticComponent: This is a binary Logistic regression component based on IRLS and column-pivoted Householder QR decomposition, the main functions are stable L2-regularized training, numerical-rank truncation, Armijo-protected updates, two-class probability inference and threshold-based classification
 
 References
 ----------
@@ -77,11 +88,19 @@ References
 
 - [Coordinate descent](https://en.wikipedia.org/wiki/Coordinate_descent)
 
+- [Logistic regression](https://en.wikipedia.org/wiki/Logistic_regression)
+
+- [Iteratively reweighted least squares](https://en.wikipedia.org/wiki/Iteratively_reweighted_least_squares)
+
+- [Backtracking line search](https://en.wikipedia.org/wiki/Backtracking_line_search)
+
 - StatJAX001 OLS Design Document `"StatJAX001 OLS SH V003"<https://github.com/redblue0216/statjax>`_
 
 - StatJAX002 Ridge Regression Design Document `"StatJAX002 Ridge SH V002"<https://github.com/redblue0216/statjax>`_
 
 - StatJAX003 LASSO Design Document `"StatJAX003 LASSO SH V001"<https://github.com/redblue0216/statjax>`_
+
+- StatJAX004 Logistic Design Document `"StatJAX004 Logistic SH V001"<https://github.com/redblue0216/statjax>`_
 '''
 
 
@@ -121,6 +140,9 @@ jax.config.update("jax_enable_x64",True)
 ###
 ### class:CDLassoComponent
 ### ------This is a LASSO regression component implementation class based on coordinate descent, the main function is to solve the L1 regularized sparse optimal regression coefficients and batch prediction, the main technical JAX technology stack (soft thresholding operator, Gauss-Seidel coordinate sweep, rank-1 residual update, lax.fori_loop compiled control flow, JIT compilation)
+###
+### class:QRLogisticComponent
+### ------This is a binary Logistic regression component based on IRLS and column-pivoted Householder QR decomposition, with numerical-rank truncation, Armijo backtracking, two-class probability inference and threshold-based classification
 ### 
 ################################################################################################################################################################################
 
@@ -1214,6 +1236,598 @@ class CDLassoComponent(BaseRegression):
 
 ##############################################################################################################################################################################
 ##############################################################################################################################################################################
+
+
+def _add_intercept(X):
+    '''Method Function:
+
+        Define an intercept augmentation function, the main function is to append a constant one column after feature standardization
+
+    :parameters:
+        - X (jnp.ndarray) - (n,p) Standardized feature matrix
+
+    :return:
+        - Xb (jnp.ndarray) - (n,p+1) Augmented design matrix, with the intercept column in the last position
+    '''
+
+    ones = jnp.ones((X.shape[0],1),dtype=X.dtype)
+    Xb = jnp.concatenate([X,ones],axis=1)
+
+    return Xb
+
+
+
+def _pivoted_qr_lstsq(A,b,rtol=1e-12):
+    '''Method Function:
+
+        Define a column-pivoted Householder QR least-squares solver, the main function is to solve min ||A*x-b||_2 with numerical rank truncation. Dynamic rank slicing intentionally keeps this function outside JIT compilation
+
+    :parameters:
+        - A (jnp.ndarray) - (m,k) Weighted and regularization-augmented least-squares matrix
+        - b (jnp.ndarray) - (m,) Least-squares right-hand side
+        - rtol (float) - Relative threshold applied to the absolute diagonal elements of R
+
+    :return:
+        - x (jnp.ndarray) - (k,) Least-squares solution restored to the original column order
+        - rank (int) - Estimated numerical rank
+    '''
+
+    ### Column-pivoted economic QR: A[:,pivots] = Q @ R
+    Q,R,pivots = qr(A,mode="economic",pivoting=True,check_finite=False)
+    diagonal = jnp.abs(jnp.diag(R))
+    if diagonal.size == 0 or float(diagonal[0]) == 0.0:
+        return jnp.zeros(A.shape[1],dtype=A.dtype),0
+
+    ### Retain only reliable directions and solve the leading upper triangular system
+    rank = int(jnp.sum(diagonal > rtol * diagonal[0]))
+    qty = Q.T @ b
+    x_permuted_head = solve_triangular(R[:rank,:rank],qty[:rank],lower=False,check_finite=False)
+
+    ### Restore the solution from pivoted column order to original column order
+    x_permuted = jnp.zeros(A.shape[1],dtype=A.dtype).at[:rank].set(x_permuted_head)
+    x = jnp.zeros_like(x_permuted).at[pivots].set(x_permuted)
+
+    return x,rank
+
+
+
+@jax.jit
+def _penalized_logistic_loss(beta,Xb,y,l2):
+    '''Method Function:
+
+        Define the stable mean binary cross-entropy loss with L2 regularization. The intercept in the last parameter position is not penalized
+
+    :parameters:
+        - beta (jnp.ndarray) - (p+1,) Feature weights and intercept in the standardized space
+        - Xb (jnp.ndarray) - (n,p+1) Standardized design matrix with an intercept column
+        - y (jnp.ndarray) - (n,) Binary observation labels
+        - l2 (float) - Non-negative L2 regularization coefficient
+
+    :return:
+        - loss (jnp.ndarray) - Scalar regularized mean binary cross-entropy loss
+    '''
+
+    eta = Xb @ beta
+    ### Stable form of log(1+exp(eta))-y*eta, avoiding log(0) from saturated probabilities
+    data_loss = jnp.mean(jnp.logaddexp(0.0,eta) - y * eta)
+    penalty = 0.5 * l2 * jnp.sum(beta[:-1] ** 2)
+
+    return data_loss + penalty
+
+
+
+@jax.jit
+def _logistic_gradient(beta,Xb,y,l2):
+    '''Method Function:
+
+        Define the analytic matrix gradient of the regularized Logistic loss, used for Armijo direction checks and independent automatic differentiation verification
+
+    :parameters:
+        - beta (jnp.ndarray) - (p+1,) Feature weights and intercept in the standardized space
+        - Xb (jnp.ndarray) - (n,p+1) Standardized design matrix with an intercept column
+        - y (jnp.ndarray) - (n,) Binary observation labels
+        - l2 (float) - Non-negative L2 regularization coefficient
+
+    :return:
+        - gradient (jnp.ndarray) - (p+1,) Analytic gradient with no intercept regularization
+    '''
+
+    eta = Xb @ beta
+    residual = jax.nn.sigmoid(eta) - y
+    data_gradient = Xb.T @ residual / Xb.shape[0]
+    regularizer = jnp.concatenate([jnp.ones(Xb.shape[1]-1,dtype=Xb.dtype),jnp.zeros(1,dtype=Xb.dtype)])
+
+    return data_gradient + l2 * regularizer * beta
+
+
+
+def _fit_qr_logistic(X,y,l2,max_iter,tol,weight_floor,qr_rtol,max_backtracks):
+    '''Method Function:
+
+        Define the QR-Logit training function, the main function is to solve regularized binary Logistic regression through IRLS, column-pivoted QR least squares and Armijo backtracking
+
+    :parameters:
+        - X (jnp.ndarray) - (n,p) Training feature matrix
+        - y (jnp.ndarray) - (n,) Binary training labels
+        - l2 (float) - Non-negative L2 regularization coefficient
+        - max_iter (int) - Maximum number of IRLS iterations
+        - tol (float) - Relative parameter-update convergence tolerance
+        - weight_floor (float) - Lower bound for IRLS probability weights
+        - qr_rtol (float) - Relative numerical-rank threshold for QR truncation
+        - max_backtracks (int) - Maximum number of Armijo step-halving attempts
+
+    :return:
+        - result (dict) - Trained standardized parameters, preprocessing statistics and optimization history
+    '''
+
+    ### Estimate preprocessing statistics from training data only and handle constant columns safely
+    mean = jnp.mean(X,axis=0)
+    scale = jnp.std(X,axis=0)
+    scale = jnp.where(scale > 1e-12,scale,1.0)
+    Xb = _add_intercept((X - mean) / scale)
+    n,d1 = Xb.shape
+
+    beta = jnp.zeros(d1,dtype=jnp.float64)
+    loss = float(_penalized_logistic_loss(beta,Xb,y,l2))
+    loss_history = [loss]
+    rank_history = []
+    converged = False
+
+    ### D masks the intercept so that only feature weights enter the L2 penalty
+    penalty_mask = jnp.concatenate([jnp.ones(d1-1,dtype=X.dtype),jnp.zeros(1,dtype=X.dtype)])
+    penalty_matrix = jnp.diag(penalty_mask)
+
+    for _ in range(max_iter):
+        eta = Xb @ beta
+        p = jax.nn.sigmoid(eta)
+        weights = jnp.clip(p * (1.0 - p),weight_floor,0.25)
+        sqrt_w = jnp.sqrt(weights)
+
+        ### Convert the Newton/IRLS step into a weighted least-squares problem
+        A_weighted = Xb * sqrt_w[:,None]
+        b_weighted = (y - p) / sqrt_w
+
+        ### Mean data loss requires n*l2 in the unscaled Newton system
+        reg_scale = jnp.sqrt(n * l2)
+        A_reg = reg_scale * penalty_matrix
+        b_reg = -reg_scale * (penalty_matrix @ beta)
+        A = jnp.concatenate([A_weighted,A_reg],axis=0)
+        b = jnp.concatenate([b_weighted,b_reg],axis=0)
+
+        delta,rank = _pivoted_qr_lstsq(A,b,rtol=qr_rtol)
+        rank_history.append(rank)
+
+        if float(jnp.linalg.norm(delta)) <= tol * (1.0 + float(jnp.linalg.norm(beta))):
+            converged = True
+            break
+
+        gradient = _logistic_gradient(beta,Xb,y,l2)
+        directional_derivative = float(jnp.dot(gradient,delta))
+        if not jnp.isfinite(directional_derivative) or directional_derivative >= 0.0:
+            raise RuntimeError("QR step is not a finite descent direction; check the rank threshold, regularization and input data")
+
+        ### Accept only a finite candidate satisfying the Armijo sufficient-decrease condition
+        accepted = False
+        step_size = 1.0
+        for _ in range(max_backtracks):
+            candidate = beta + step_size * delta
+            candidate_loss = float(_penalized_logistic_loss(candidate,Xb,y,l2))
+            armijo_bound = loss + 1e-4 * step_size * directional_derivative
+            if jnp.isfinite(candidate_loss) and candidate_loss <= armijo_bound:
+                accepted = True
+                break
+            step_size *= 0.5
+
+        if not accepted:
+            raise RuntimeError("Armijo backtracking failed; increase l2 or inspect the data for complete separation")
+
+        beta = candidate
+        loss = candidate_loss
+        loss_history.append(loss)
+
+        relative_update = float(jnp.linalg.norm(step_size * delta)) / (1.0 + float(jnp.linalg.norm(beta)))
+        if relative_update <= tol:
+            converged = True
+            break
+
+    return {
+        "beta_hat": beta,
+        "mean": mean,
+        "scale": scale,
+        "loss_history": loss_history,
+        "rank_history": rank_history,
+        "converged": converged,
+        "n_iter": len(loss_history) - 1
+    }
+
+
+
+@jax.jit
+def _predict_logistic_proba(A_test,beta_hat,mean,scale):
+    '''Method Function:
+
+        Define a JIT-compiled Logistic probability inference function, reusing training-set standardization and appending the intercept in the same position as training
+
+    :parameters:
+        - A_test (jnp.ndarray) - (m,p) Test feature matrix
+        - beta_hat (jnp.ndarray) - (p+1,) Trained standardized feature weights and intercept
+        - mean (jnp.ndarray) - (p,) Training-set feature means
+        - scale (jnp.ndarray) - (p,) Training-set feature standard deviations
+
+    :return:
+        - probabilities (jnp.ndarray) - (m,2) Negative-class and positive-class probabilities
+    '''
+
+    Xb = _add_intercept((A_test - mean) / scale)
+    positive = jax.nn.sigmoid(Xb @ beta_hat)
+    probabilities = jnp.stack([1.0 - positive,positive],axis=1)
+
+    return probabilities
+
+
+
+class QRLogisticComponent(BaseRegression):
+    '''Class Introduction:
+
+        This is a binary Logistic regression component based on iteratively reweighted least squares (IRLS) and column-pivoted Householder QR decomposition. The main functions are stable L2-regularized training, numerical-rank diagnostics, Armijo-protected parameter updates, two-class probability inference and threshold-based classification. It is intended for small and medium dense data, teaching, algorithm verification and numerically sensitive reference workflows
+
+    Mathematical principle
+    ----------------------
+    (1) Binary Logistic model: given n samples and p features, the inputs are $X in R^(n*p)$ and $y in {0,1}^n$ (X ∈ R^(n×p), y ∈ {0,1}ⁿ). Features are standardized using training-set statistics only, then a constant column is appended:
+
+        $X_tilde = [X_scaled,1] , beta = [w,b]$
+        X̃ = [X_scaled, 1] ∈ R^(n×(p+1)), β = [w, b]ᵀ, where b is the unpenalized intercept
+
+        $eta = X_tilde*beta , p_i = P(y_i=1|x_i,beta) = sigmoid(eta_i)$
+        η = X̃β, p_i = σ(η_i), σ(η) = 1/(1+e^(-η)), with Sigmoid applied element-wise
+
+    (2) Stable regularized objective: the component minimizes mean binary cross-entropy plus an L2 penalty on feature weights only:
+
+        $J(beta) = (1/n)*sum_i[log(1+exp(eta_i))-y_i*eta_i] + (l2/2)*||w||_2^2 , l2 >= 0$
+        J(β) = (1/n)Σᵢ[log(1+e^ηᵢ)−yᵢηᵢ] + (λ/2)‖w‖₂², λ = l2 ≥ 0
+
+        The expression log(1+exp(eta))-y*eta is equivalent to -y*log(p)-(1-y)*log(1-p), but jnp.logaddexp avoids evaluating log(0) when Sigmoid probabilities saturate. The last parameter is the intercept and is excluded from both the loss penalty and its gradient
+
+    (3) Gradient and Hessian: let $W=diag(w_i)$ with $w_i=p_i*(1-p_i)$ (W = diag(wᵢ), wᵢ = pᵢ(1−pᵢ)), and let $D=diag(1,...,1,0)$ (D = diag(1,…,1,0)) mask the intercept:
+
+        $g = (1/n)*X_tilde^T*(p-y) + l2*D*beta$
+        g = (1/n)X̃ᵀ(p−y) + λDβ
+
+        $H = (1/n)*X_tilde^T*W*X_tilde + l2*D$
+        H = (1/n)X̃ᵀWX̃ + λD
+
+        The Newton direction satisfies H*delta=-g. Multiplication by n gives the unscaled system actually encoded by the weighted least-squares rows:
+
+        $(X_tilde^T*W*X_tilde+n*l2*D)*delta = X_tilde^T*(y-p)-n*l2*D*beta$
+        (X̃ᵀWX̃+nλD)δ = X̃ᵀ(y−p)−nλDβ
+
+        The n*l2 factor is essential because the data loss is averaged while the L2 penalty is not averaged
+
+    (4) Equivalent IRLS least-squares system: define $S=W^(1/2)$ and $r_lambda=sqrt(n*l2)$ (S = W^(1/2), r_λ = √(nλ)). Each iteration constructs:
+
+        $A = [S*X_tilde ; r_lambda*D] , c = [S^(-1)*(y-p) ; -r_lambda*D*beta]$
+        A = [SX̃; √(nλ)D], c = [S⁻¹(y−p); −√(nλ)Dβ]
+
+        and solves $min_delta ||A*delta-c||_2^2$ (min_δ ‖Aδ−c‖₂²). Its normal equations are exactly the Newton system above, but the implementation never explicitly forms X̃ᵀWX̃, AᵀA or a matrix inverse. This is also the step form of classical IRLS with working response $z_i=x_tilde_i^T*beta+(y_i-p_i)/w_i$ (zᵢ = x̃ᵢᵀβ+(yᵢ−pᵢ)/wᵢ)
+
+    (5) Householder QR and column pivoting: a Householder reflection $H=I-2*v*v^T/(v^T*v)$ (H = I−2vvᵀ/(vᵀv)) is symmetric and orthogonal. Column-pivoted QR computes:
+
+        $A*P = Q*R , A[:,pivots] = Q*R$
+        AP = QR, equivalently A[:, pivots] = QR
+
+        Orthogonal transformations preserve the vector 2-norm and avoid the condition-number squaring caused by explicitly constructing AᵀA. If the estimated numerical rank is r, only the reliable leading system $R_11*u=(Q^T*c)_1:r$ (R₁₁u = (Qᵀc)₁:ᵣ) is solved; remaining permuted components are zero and .at[pivots].set(...) restores original column order
+
+        Rank r is estimated by $|R_ii| > qr_rtol*|R_00|$ (|Rᵢᵢ| > qr_rtol·|R₀₀|). This yields a basic solution determined by pivoted columns, not necessarily the SVD minimum-norm solution, and diagonal-based rank revelation is not infallible for every ill-conditioned matrix
+
+    (6) Why IRLS + column-pivoted QR: the method is selected for numerical transparency and stability, not because it is fastest at every scale:
+
+        ==================  ================================  ==========================================  ==================================
+        Method              Main per-iteration work            Numerical/storage property               Typical scenario
+        ==================  ================================  ==========================================  ==================================
+        Gradient descent    O(n*p) matrix operations            Simple and memory efficient; many steps  Baseline and large simple training
+        L-BFGS              Matrix-vector products              No explicit Hessian; general purpose     Medium/high-dimensional optimization
+        Newton-CG           Hessian-vector products             No complete Hessian required             High-dimensional or sparse problems
+        IRLS + Cholesky     Hessian construction + O(p^3)        Fast for stable positive definite H     Small dense regularized problems
+        IRLS + pivoted QR   Weighted QR, about O(n*p^2), n>>p    No Hessian inverse; rank diagnostics    Dense reference and collinear data
+        IRLS + SVD          Usually higher decomposition cost    Direct spectrum and rank analysis      Small ill-conditioned diagnostics
+        ==================  ================================  ==========================================  ==================================
+
+        For very high-dimensional, strongly sparse or very large data, L-BFGS, Newton-CG or coordinate methods may be more appropriate
+
+    Algorithm flow
+    --------------
+    .. code-block:: text
+
+        Input A(n×p), b(n,), l2 and optimization controls
+            |
+            v
+        Validate finite binary inputs and compute training-only mean / scale
+            |
+            v
+        Standardize features -> append intercept -> initialize beta = 0
+            |
+            v
+        eta = Xb*beta -> p = sigmoid(eta) -> w = clip(p*(1-p))
+            |
+            v
+        Build weighted data rows and sqrt(n*l2) regularization rows
+            |
+            v
+        Column-pivoted economic Householder QR: A[:,pivots] = Q*R
+            |
+            v
+        Estimate rank -> truncated R11 triangular solve -> restore column order
+            |
+            v
+        Check g.T*delta < 0 -> Armijo backtracking -> beta = beta + alpha*delta
+            |
+            +------------> Record finite loss, numerical rank and convergence state
+            |
+            v
+        Inference: reuse mean / scale -> append intercept -> Sigmoid
+            |
+            +------------> predict_proba: [1-p1,p1]; reasoning: p1 >= threshold
+
+    Step 1 (input and precision): convert inputs to float64, require A(n,p) and b(n,) with matching non-empty samples, finite values and labels in {0,1}. The module enables jax_enable_x64 before component arrays are created
+
+    Step 2 (training-only preprocessing): compute $mu_j=(1/n)*sum_iX_ij$ and $s_j=std(X_:,j)$ (μⱼ = (1/n)ΣᵢXᵢⱼ, sⱼ = std(X:,j)). Replace near-zero scale by 1, standardize, then append the intercept. Test data never participates in estimating these statistics
+
+    Step 3 (initialization): set beta=0 in the standardized augmented space. All initial positive-class probabilities are 0.5 and initial unregularized data loss is log(2)
+
+    Step 4 (IRLS weights): compute eta, p and $w_i=clip(p_i*(1-p_i),weight_floor,0.25)$ (wᵢ = clip(pᵢ(1−pᵢ), weight_floor, 1/4)). The floor is numerical protection, not part of the original statistical model
+
+    Step 5 (weighted rows): construct $A_weighted=sqrt(W)*X_tilde$ and $c_weighted=(y-p)/sqrt(W)$ (A_weighted = √W·X̃, c_weighted = (y−p)/√W) without materializing an n×n diagonal W
+
+    Step 6 (regularization rows): append sqrt(n*l2)*D and -sqrt(n*l2)*D*beta. This encodes both nλD in the Hessian and −nλDβ on the right-hand side while leaving the intercept unpenalized
+
+    Step 7 (pivoted QR): call jax.scipy.linalg.qr(A,mode="economic",pivoting=True). Economic QR avoids unneeded full-Q dimensions; Householder transformations provide the stable orthogonal factorization
+
+    Step 8 (rank truncation): use diag(R) and qr_rtol to select r, solve only R11 by upper triangular back substitution, set unreliable directions to zero and restore the original parameter order with pivots
+
+    Step 9 (descent and Armijo): compute the analytic gradient and require $g^T*delta<0$ (gᵀδ < 0). Try alpha in {1,1/2,1/4,...} until:
+
+        $J(beta+alpha*delta) <= J(beta)+c1*alpha*g^T*delta , c1=1e-4$
+        J(β+αδ) ≤ J(β)+c₁αgᵀδ, c₁ = 10⁻⁴
+
+        Non-finite candidates and non-descent directions are rejected explicitly rather than silently accepted
+
+    Step 10 (update and convergence): update beta, record loss and stop when $||alpha*delta||_2/(1+||beta||_2)<=tol$ (‖αδ‖₂/(1+‖β‖₂) ≤ tol) or max_iter is reached. loss_history includes the initial loss, so n_iter=len(loss_history)-1; rank_history can contain one additional final QR evaluation without a parameter update
+
+    Step 11 (probability inference): reuse mean and scale, append the intercept and compute $p1=sigmoid(X_tilde_new*beta)$ (p₁ = σ(X̃_newβ)). predict_proba returns [1-p1,p1] with shape (m,2), and each row sums to 1
+
+    Step 12 (class inference): reasoning returns int32 values 0 or 1 according to p1>=threshold. The threshold changes only the decision rule, not the trained probability model
+
+    JAX unique advantages
+    ---------------------
+    (1) Explicit precision and vectorized matrix computation: module-level float64 is used for repeated QR, weight division and triangular solves. Matrix products and row weighting avoid Python sample loops
+
+    (2) Selective JIT compilation: the pure loss, analytic gradient and fixed-shape probability inference use @jax.jit. The dynamic-rank QR solver intentionally does not, because rank=int(...) synchronizes with the host and R[:rank,:rank] requires static shapes under JIT
+
+    (3) Automatic differentiation as an independent checker: training directions come from QR rather than gradient descent, while jax.grad can independently verify the analytic gradient:
+
+    .. code-block:: python
+
+        import jax
+        from statjax.regression._components import _penalized_logistic_loss,_logistic_gradient
+
+        manual = _logistic_gradient(beta,Xb,y,l2)
+        automatic = jax.grad(_penalized_logistic_loss,argnums=0)(beta,Xb,y,l2)
+        relative_error = jax.numpy.linalg.norm(manual-automatic) / (1.0+jax.numpy.linalg.norm(automatic))
+
+    (4) Immutable functional updates: JAX arrays use .at[pivots].set(...) to restore pivoted solutions without in-place mutation. This makes the permutation explicit and compatible with JAX array semantics
+
+    (5) Reproducible verification: tests derive data and split keys from explicit PRNGKey values. Cross-version, backend or hardware bitwise identity is not assumed, especially when pivots tie or diagonal values approach the rank threshold
+
+    (6) Backend migration with explicit boundaries: matrix operations can run on supported JAX backends, but pivoted QR support, performance and determinism must be verified per backend. CPU is the reference environment. Host conversions such as float(...) and int(...) prioritize clear optimization control over maximum throughput; benchmarks must use block_until_ready() for correct asynchronous timing
+
+    Precautions
+    -----------
+    (1) QR is not universally fastest: each iteration performs a matrix decomposition. Assess alternative optimizers for high-dimensional, sparse or very large workloads
+
+    (2) Never explicitly invert the Hessian: theoretical inverse notation is only mathematical shorthand. This implementation solves weighted least squares directly through QR and triangular back substitution
+
+    (3) Never compute log(sigmoid(eta)) directly: saturated probabilities can produce log(0). The stable logaddexp formulation is required
+
+    (4) weight_floor changes extreme-region Newton equations: persistent activation can indicate complete separation, poor feature scaling or insufficient regularization; do not hide the issue by only increasing max_iter
+
+    (5) Match regularization scaling: mean data loss requires sqrt(n*l2) augmentation. Changing the loss to a sum requires a corresponding change to the QR system
+
+    (6) Keep the intercept unpenalized: loss, analytic gradient and QR regularization rows must all use the same D mask; changing only one location makes the algorithm internally inconsistent
+
+    (7) qr_rtol has no universal value: too small can retain noise directions, while too large can discard informative directions. Inspect rank_history, residuals and validation behavior
+
+    (8) Rank-truncated QR is not an SVD minimum-norm solver: use SVD separately when a singular spectrum, systematic rank analysis or minimum-norm solution is required
+
+    (9) Complete separation can make unregularized maximum-likelihood parameters diverge: prefer a small positive l2 and monitor parameter norms, losses and converged status
+
+    (10) Reuse training preprocessing: inference and deployment must use the stored mean and scale in the original order standardize -> append intercept -> matrix multiply -> Sigmoid
+
+    (11) Respect pivot conventions: this component uses A[:,pivots]=Q@R and .at[pivots].set(...). Reverify conventions before replacing the QR implementation
+
+    (12) Dynamic rank causes synchronization: rank=int(...) and Python slicing are deliberate reference-implementation boundaries, not a maximum-throughput design
+
+    (13) Accuracy is not a sufficient correctness test: retain gradient, QR rank/residual, monotone loss and probability checks because apparently reasonable labels can conceal mathematical errors
+
+    (14) Production use needs additional engineering: model serialization, stronger schema checks, outlier handling, threshold calibration and genuine cross-validation are outside this component's current scope
+
+    :example:
+        >>> import jax
+        >>> import jax.numpy as jnp
+        >>> from statjax.regression import QRLogisticComponent
+        >>> # Generate reproducible correlated features and binary labels
+        >>> keys = jax.random.split(jax.random.PRNGKey(42),5)
+        >>> latent = jax.random.normal(keys[0],(600,4),dtype=jnp.float64)
+        >>> mixing = jax.random.normal(keys[1],(4,8),dtype=jnp.float64) / 2.0
+        >>> A = latent @ mixing + 0.35 * jax.random.normal(keys[2],(600,8),dtype=jnp.float64)
+        >>> true_w = 0.8 * jax.random.normal(keys[3],(8,),dtype=jnp.float64)
+        >>> b = jax.random.bernoulli(keys[4],jax.nn.sigmoid(0.35+A@true_w)).astype(jnp.float64)
+        >>> # Split before fitting so standardization uses training data only
+        >>> A_train,A_test = A[:480],A[480:]
+        >>> b_train,b_test = b[:480],b[480:]
+        >>> logistic_instance = QRLogisticComponent(l2=1e-6)
+        >>> beta_hat,metrics = logistic_instance.train(A=A_train,b=b_train)
+        >>> probabilities = logistic_instance.predict_proba(A_test=A_test)
+        >>> y_pred = logistic_instance.reasoning(A_test=A_test)
+        >>> accuracy = jnp.mean(y_pred == b_test.astype(jnp.int32))
+
+    :reference:
+        - [Logistic regression](https://en.wikipedia.org/wiki/Logistic_regression)
+        - [Iteratively reweighted least squares](https://en.wikipedia.org/wiki/Iteratively_reweighted_least_squares)
+        - [Householder transformation](https://en.wikipedia.org/wiki/Householder_transformation)
+        - [QR decomposition](https://en.wikipedia.org/wiki/QR_decomposition)
+        - [Backtracking line search](https://en.wikipedia.org/wiki/Backtracking_line_search)
+        - StatJAX004 Logistic Design Document `"StatJAX004 Logistic SH V001"<https://github.com/redblue0216/statjax>`_
+    '''
+
+
+    def __init__(self,l2=1e-6,max_iter=50,tol=1e-8,weight_floor=1e-8,qr_rtol=1e-12,max_backtracks=20,threshold=0.5):
+        '''Attribute Function:
+
+            Define an initialization method, mainly used to initialize Logistic optimization hyperparameters and trained model state
+
+        :parameters:
+            - l2 (float) - Non-negative L2 regularization coefficient; the intercept is not penalized
+            - max_iter (int) - Maximum number of IRLS iterations
+            - tol (float) - Relative parameter-update convergence tolerance
+            - weight_floor (float) - Positive lower bound no greater than 0.25 for IRLS weights
+            - qr_rtol (float) - Positive relative numerical-rank threshold
+            - max_backtracks (int) - Maximum number of Armijo backtracking attempts
+            - threshold (float) - Positive-class decision threshold in [0,1]
+        '''
+
+        if not 0.0 <= l2 < float("inf"):
+            raise ValueError("l2 must be finite and non-negative")
+        if not isinstance(max_iter,int) or isinstance(max_iter,bool) or max_iter < 1:
+            raise ValueError("max_iter must be a positive integer")
+        if not 0.0 < tol < float("inf"):
+            raise ValueError("tol must be finite and positive")
+        if not 0.0 < weight_floor <= 0.25:
+            raise ValueError("weight_floor must be in (0,0.25]")
+        if not 0.0 < qr_rtol < float("inf"):
+            raise ValueError("qr_rtol must be finite and positive")
+        if not isinstance(max_backtracks,int) or isinstance(max_backtracks,bool) or max_backtracks < 1:
+            raise ValueError("max_backtracks must be a positive integer")
+        if not 0.0 <= threshold <= 1.0:
+            raise ValueError("threshold must be in [0,1]")
+
+        self.l2 = l2
+        self.max_iter = max_iter
+        self.tol = tol
+        self.weight_floor = weight_floor
+        self.qr_rtol = qr_rtol
+        self.max_backtracks = max_backtracks
+        self.threshold = threshold
+        ### None means that training has not produced standardized parameters or preprocessing statistics
+        self.beta_hat = None
+        self.mean = None
+        self.scale = None
+        self.metrics = None
+
+
+    def train(self,A,b):
+        '''Method Function:
+
+            Define a training method, the main function is to solve binary Logistic regression through standardized IRLS, column-pivoted QR and Armijo backtracking
+
+        :parameters:
+            - A (jnp.ndarray) - (n,p) Training feature matrix
+            - b (jnp.ndarray) - (n,) Binary training labels containing only 0 and 1
+
+        :return:
+            - beta_hat (jnp.ndarray) - (p+1,) Standardized feature weights followed by the intercept
+            - metrics (dict) - Loss history, QR rank history, convergence state, iteration count and regularization coefficient
+        '''
+
+        A = jnp.asarray(A,dtype=jnp.float64)
+        b = jnp.asarray(b,dtype=jnp.float64)
+        if A.ndim != 2 or b.ndim != 1 or A.shape[0] != b.shape[0]:
+            raise ValueError("A must have shape (n,p), b must have shape (n,), and their sample counts must match")
+        if A.shape[0] == 0 or A.shape[1] == 0:
+            raise ValueError("A and b must be non-empty and A must contain at least one feature")
+        if not bool(jnp.all(jnp.isfinite(A))) or not bool(jnp.all(jnp.isfinite(b))):
+            raise ValueError("A and b must contain only finite values")
+        if not bool(jnp.all((b == 0.0) | (b == 1.0))):
+            raise ValueError("b must contain only binary labels 0 and 1")
+
+        result = _fit_qr_logistic(A,b,self.l2,self.max_iter,self.tol,self.weight_floor,self.qr_rtol,self.max_backtracks)
+
+        self.beta_hat = result["beta_hat"]
+        self.mean = result["mean"]
+        self.scale = result["scale"]
+        self.metrics = {
+            "initial_loss": result["loss_history"][0],
+            "final_loss": result["loss_history"][-1],
+            "loss_history": result["loss_history"],
+            "rank_history": result["rank_history"],
+            "converged": result["converged"],
+            "n_iter": result["n_iter"],
+            "l2": self.l2
+        }
+
+        return self.beta_hat,self.metrics
+
+
+    def predict_proba(self,A_test):
+        '''Method Function:
+
+            Define a probability inference method, reusing training-set preprocessing to return negative-class and positive-class probabilities
+
+        :parameters:
+            - A_test (jnp.ndarray) - (m,p) Test feature matrix with the training feature dimension
+
+        :return:
+            - probabilities (jnp.ndarray) - (m,2) Columns [P(y=0|x),P(y=1|x)]
+        '''
+
+        if self.beta_hat is None:
+            raise RuntimeError("QRLogisticComponent has not been trained yet, please call the train method first")
+
+        A_test = jnp.asarray(A_test,dtype=jnp.float64)
+        if A_test.ndim != 2 or A_test.shape[1] != self.mean.shape[0]:
+            raise ValueError("A_test must have shape (m,p) with the same feature dimension as training data")
+        if not bool(jnp.all(jnp.isfinite(A_test))):
+            raise ValueError("A_test must contain only finite values")
+
+        return _predict_logistic_proba(A_test,self.beta_hat,self.mean,self.scale)
+
+
+    def reasoning(self,A_test):
+        '''Method Function:
+
+            Define a classification inference method, the main function is to threshold positive-class probabilities into binary class predictions
+
+        :parameters:
+            - A_test (jnp.ndarray) - (m,p) Test feature matrix with the training feature dimension
+
+        :return:
+            - y_pred (jnp.ndarray) - (m,) Binary predictions with dtype int32
+        '''
+
+        probabilities = self.predict_proba(A_test)
+        y_pred = (probabilities[:,1] >= self.threshold).astype(jnp.int32)
+
+        return y_pred
+
+
+    def _info(self):
+        '''Method Function:
+
+            Define an internal method to obtain basic meta information
+
+        :parameters:
+            nothing
+
+        :return:
+            - info (str) - Text introduction of the component
+        '''
+
+        return "QRLogisticComponent: binary Logistic regression component based on IRLS and column-pivoted Householder QR decomposition, implemented with the JAX technology stack"
+
+
+
+##############################################################################################################################################################################
+##############################################################################################################################################################################
+
 
 
 ### End of file  

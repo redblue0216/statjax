@@ -57,7 +57,7 @@ python build.py --clean --install
 ```python
 import jax
 import jax.numpy as jnp
-from statjax.regression import HouseholderOLSComponent, SVDRidgeComponent, CDLassoComponent
+from statjax.regression import HouseholderOLSComponent, SVDRidgeComponent, CDLassoComponent, QRLogisticComponent
 
 # Prepare the training data (column full rank design matrix A and observation labels b)
 A_train = jax.random.normal(jax.random.PRNGKey(0), (100, 5))
@@ -79,6 +79,15 @@ y_pred = ridge.reasoning(A_test=A_train)
 lasso = CDLassoComponent(lam=0.01)
 w_hat, metrics = lasso.train(A=A_train, b=b_train)
 y_pred = lasso.reasoning(A_test=A_train)
+
+# Train binary Logistic regression on labels containing only 0 and 1
+binary_labels = jax.random.bernoulli(
+    jax.random.PRNGKey(1), jax.nn.sigmoid(0.35 + A_train @ x_hat)
+).astype(jnp.float64)
+logistic = QRLogisticComponent(l2=1e-6)
+beta_hat, metrics = logistic.train(A=A_train, b=binary_labels)
+probabilities = logistic.predict_proba(A_test=A_train)
+class_pred = logistic.reasoning(A_test=A_train)
 ```
 
 Runnable end-to-end demos:
@@ -87,6 +96,7 @@ Runnable end-to-end demos:
 python example/example_001.py   # OLS (Householder QR)
 python example/example_002.py   # Ridge regression (SVD)
 python example/example_003.py   # LASSO (coordinate descent)
+python example/example_004.py   # Binary Logistic regression (IRLS + pivoted QR)
 ```
 
 Run unit tests:
@@ -96,11 +106,11 @@ pip install pytest
 python -m pytest -v
 ```
 
-For the complete self-test process from scratch, see [StatJAX自我测试完整流程_SH_V003.md](design/StatJAX自我测试完整流程_SH_V003.md).
+For the complete self-test process from scratch, see [StatJAX自我测试完整流程_SH_V004.md](design/StatJAX自我测试完整流程_SH_V004.md).
 
 ### 3.3 design
 <details>
-<summary>Click to view design documents (9 files)</summary>
+<summary>Click to view design documents (12 files)</summary>
 
 | File | Description |
 |:----|:----|
@@ -111,8 +121,11 @@ For the complete self-test process from scratch, see [StatJAX自我测试完整�
 | [StatJAX002_岭回归_SH_V002.md](design/StatJAX002_岭回归_SH_V002.md) | Ridge regression algorithm document: SVD-based ridge regression |
 | [StatJAX003_实施方案_SH_V001.md](design/StatJAX003_实施方案_SH_V001.md) | Implementation plan for the StatJAX003 iteration |
 | [StatJAX003_LASSO_SH_V001.md](design/StatJAX003_LASSO_SH_V001.md) | LASSO algorithm document: coordinate descent for L1-regularized regression |
+| [StatJAX004_实施方案_SH_V001.md](design/StatJAX004_实施方案_SH_V001.md) | Implementation plan for the StatJAX004 iteration |
+| [StatJAX004_logistic_SH_V001.md](design/StatJAX004_logistic_SH_V001.md) | Logistic algorithm document: IRLS, column-pivoted Householder QR and Armijo backtracking |
 | [StatJAX自我测试完整流程_SH_V002.md](design/StatJAX自我测试完整流程_SH_V002.md) | Complete self-test process of StatJAX from scratch (for statjax 0.2.1) |
 | [StatJAX自我测试完整流程_SH_V003.md](design/StatJAX自我测试完整流程_SH_V003.md) | Complete self-test process of StatJAX from scratch (for statjax 0.3.1) |
+| [StatJAX自我测试完整流程_SH_V004.md](design/StatJAX自我测试完整流程_SH_V004.md) | Complete self-test process of StatJAX from scratch (for statjax 0.4.1) |
 </details>
 
 ## 4.algorithm
@@ -123,10 +136,17 @@ For the complete self-test process from scratch, see [StatJAX自我测试完整�
 | regression | HouseholderOLSComponent | Ordinary least squares (OLS) solved by Householder QR decomposition: min ‖A·x − b‖₂², equivalently transformed into R·x̂ = Qᵀ·b | Optimal numerical stability (no condition number squaring); fully differentiable, JIT-compilable and GPU-accelerated based on JAX |
 | regression | SVDRidgeComponent | Ridge regression solved by SVD decomposition: min ‖X·w − y‖₂² + λ·‖w‖₂², reduced to per-singular-component shrinkage ŵ = V·diag(σᵢ/(σᵢ²+λ))·Uᵀ·y | Natively carries L2 regularization; numerically stable under multicollinearity and rank deficiency; fully differentiable, JIT-compilable and GPU-accelerated based on JAX |
 | regression | CDLassoComponent | LASSO solved by coordinate descent: min ½‖y − X·β‖₂² + λ·‖β‖₁, per-coordinate exact minimization with the soft thresholding operator β_j = soft(z_j, λ)/s_j and rank-1 residual update | Exactly sparse solutions with feature selection; no matrix decomposition required, high-dimensional friendly; KKT optimality verification (JAX native); fully differentiable, JIT-compilable and GPU-accelerated based on JAX |
+| regression | QRLogisticComponent | Binary Logistic regression with mean cross-entropy and L2-regularized weights, solved by IRLS and column-pivoted Householder QR with numerical-rank truncation and Armijo backtracking | Stable logaddexp loss; unpenalized intercept; training-only standardization; two-column probabilities and binary classes; selective JIT for loss, gradient and inference, while dynamic-rank QR remains host-controlled |
 
 ## 5.ChangeLog
 <details>
 <summary>Click to view ChangeLog</summary>
+
+### Version-0.4.1
+  - Added the regression component QRLogisticComponent (binary Logistic regression based on IRLS and column-pivoted Householder QR)
+  - Added the unit test file statjax/tests/test_logistic.py with 12 numerical, inference and validation tests
+  - Deepened project-wide comments, integrating the overall design and Logistic algorithm document (StatJAX004)
+  - Updated the self-test process document to StatJAX自我测试完整流程_SH_V004.md
 
 ### Version-0.3.1
   - Added the regression component CDLassoComponent (LASSO regression based on coordinate descent)

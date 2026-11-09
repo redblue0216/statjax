@@ -88,13 +88,19 @@ Usage examples
 .. code-block:: python
     :linenos:
 
-    from statjax.regression import HouseholderOLSComponent
+    from statjax.regression import HouseholderOLSComponent,QRLogisticComponent
 
     ### Train the OLS model and solve the optimal regression coefficients
     ols_instance = HouseholderOLSComponent()
     x_hat,metrics = ols_instance.train(A=A_train,b=b_train)
     ### Batch prediction on the test set
     y_pred = ols_instance.reasoning(A_test=A_test)
+
+    ### A Component can also expose algorithm-specific inference while preserving train / reasoning / _info
+    logistic_instance = QRLogisticComponent(l2=1e-6)
+    beta_hat,metrics = logistic_instance.train(A=A_binary_train,b=b_binary_train)
+    probabilities = logistic_instance.predict_proba(A_test=A_binary_test)
+    y_pred = logistic_instance.reasoning(A_test=A_binary_test)
 
 Class Description
 -----------------
@@ -133,13 +139,13 @@ def _read_version() -> str:
         text = pyproject.read_text(encoding='utf-8')
         import re as _re
         m = _re.search(r'^version\s*=\s*"([^"]+)"', text, _re.M)
-        return m.group(1) if m else '0.2.1'
+        return m.group(1) if m else '0.4.1'
     except Exception:
         pass
     try:
         return _im.version('statjax')
     except Exception:
-        return '0.2.1'
+        return '0.4.1'
 
 
 

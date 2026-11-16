@@ -57,7 +57,8 @@ python build.py --clean --install
 ```python
 import jax
 import jax.numpy as jnp
-from statjax.regression import HouseholderOLSComponent, SVDRidgeComponent, CDLassoComponent, QRLogisticComponent
+from jax.scipy.stats import norm
+from statjax.regression import HouseholderOLSComponent, SVDRidgeComponent, CDLassoComponent, QRLogisticComponent, QRProbitComponent
 
 # Prepare the training data (column full rank design matrix A and observation labels b)
 A_train = jax.random.normal(jax.random.PRNGKey(0), (100, 5))
@@ -88,6 +89,17 @@ logistic = QRLogisticComponent(l2=1e-6)
 beta_hat, metrics = logistic.train(A=A_train, b=binary_labels)
 probabilities = logistic.predict_proba(A_test=A_train)
 class_pred = logistic.reasoning(A_test=A_train)
+
+# Train binary Probit regression; the caller supplies the intercept column
+A_probit = jnp.concatenate([jnp.ones((A_train.shape[0], 1)), A_train], axis=1)
+probit_true = jnp.array([0.35, 1.2, -2.1, 0.7, 3.3, -1.5])
+probit_labels = jax.random.bernoulli(
+    jax.random.PRNGKey(2), norm.cdf(A_probit @ probit_true)
+).astype(jnp.float64)
+probit = QRProbitComponent()
+probit_beta, metrics = probit.train(A=A_probit, b=probit_labels)
+probabilities = probit.predict_proba(A_test=A_probit)
+class_pred = probit.reasoning(A_test=A_probit)
 ```
 
 Runnable end-to-end demos:
@@ -97,6 +109,7 @@ python example/example_001.py   # OLS (Householder QR)
 python example/example_002.py   # Ridge regression (SVD)
 python example/example_003.py   # LASSO (coordinate descent)
 python example/example_004.py   # Binary Logistic regression (IRLS + pivoted QR)
+python example/example_005.py   # Binary Probit regression (Fisher scoring + pivoted QR)
 ```
 
 Run unit tests:
@@ -106,11 +119,11 @@ pip install pytest
 python -m pytest -v
 ```
 
-For the complete self-test process from scratch, see [StatJAX自我测试完整流程_SH_V004.md](design/StatJAX自我测试完整流程_SH_V004.md).
+For the complete self-test process from scratch, see [StatJAX自我测试完整流程_SH_V005.md](design/StatJAX自我测试完整流程_SH_V005.md).
 
 ### 3.3 design
 <details>
-<summary>Click to view design documents (12 files)</summary>
+<summary>Click to view design documents (15 files)</summary>
 
 | File | Description |
 |:----|:----|
@@ -123,9 +136,12 @@ For the complete self-test process from scratch, see [StatJAX自我测试完整�
 | [StatJAX003_LASSO_SH_V001.md](design/StatJAX003_LASSO_SH_V001.md) | LASSO algorithm document: coordinate descent for L1-regularized regression |
 | [StatJAX004_实施方案_SH_V001.md](design/StatJAX004_实施方案_SH_V001.md) | Implementation plan for the StatJAX004 iteration |
 | [StatJAX004_logistic_SH_V001.md](design/StatJAX004_logistic_SH_V001.md) | Logistic algorithm document: IRLS, column-pivoted Householder QR and Armijo backtracking |
+| [StatJAX005_实施方案_SH_V001.md](design/StatJAX005_实施方案_SH_V001.md) | Implementation plan for the StatJAX005 iteration |
+| [StatJAX005_Probit_SH_V001.md](design/StatJAX005_Probit_SH_V001.md) | Probit algorithm document: Fisher scoring, column-pivoted Householder QR and Armijo step halving |
 | [StatJAX自我测试完整流程_SH_V002.md](design/StatJAX自我测试完整流程_SH_V002.md) | Complete self-test process of StatJAX from scratch (for statjax 0.2.1) |
 | [StatJAX自我测试完整流程_SH_V003.md](design/StatJAX自我测试完整流程_SH_V003.md) | Complete self-test process of StatJAX from scratch (for statjax 0.3.1) |
 | [StatJAX自我测试完整流程_SH_V004.md](design/StatJAX自我测试完整流程_SH_V004.md) | Complete self-test process of StatJAX from scratch (for statjax 0.4.1) |
+| [StatJAX自我测试完整流程_SH_V005.md](design/StatJAX自我测试完整流程_SH_V005.md) | Complete self-test process of StatJAX from scratch (for statjax 0.5.1) |
 </details>
 
 ## 4.algorithm
@@ -137,10 +153,17 @@ For the complete self-test process from scratch, see [StatJAX自我测试完整�
 | regression | SVDRidgeComponent | Ridge regression solved by SVD decomposition: min ‖X·w − y‖₂² + λ·‖w‖₂², reduced to per-singular-component shrinkage ŵ = V·diag(σᵢ/(σᵢ²+λ))·Uᵀ·y | Natively carries L2 regularization; numerically stable under multicollinearity and rank deficiency; fully differentiable, JIT-compilable and GPU-accelerated based on JAX |
 | regression | CDLassoComponent | LASSO solved by coordinate descent: min ½‖y − X·β‖₂² + λ·‖β‖₁, per-coordinate exact minimization with the soft thresholding operator β_j = soft(z_j, λ)/s_j and rank-1 residual update | Exactly sparse solutions with feature selection; no matrix decomposition required, high-dimensional friendly; KKT optimality verification (JAX native); fully differentiable, JIT-compilable and GPU-accelerated based on JAX |
 | regression | QRLogisticComponent | Binary Logistic regression with mean cross-entropy and L2-regularized weights, solved by IRLS and column-pivoted Householder QR with numerical-rank truncation and Armijo backtracking | Stable logaddexp loss; unpenalized intercept; training-only standardization; two-column probabilities and binary classes; selective JIT for loss, gradient and inference, while dynamic-rank QR remains host-controlled |
+| regression | QRProbitComponent | Unregularized binary Probit maximum-likelihood estimation solved by Fisher scoring/IRLS and column-pivoted Householder QR, with numerical-rank errors and Armijo step halving | Stable normal log-CDF likelihood; caller-prepared intercept and preprocessing; two-column normal-CDF probabilities and binary classes; selective JIT matrix kernels with host-controlled diagnostics |
 
 ## 5.ChangeLog
 <details>
 <summary>Click to view ChangeLog</summary>
+
+### Version-0.5.1
+  - Added the regression component QRProbitComponent (binary Probit regression based on Fisher scoring and column-pivoted Householder QR)
+  - Added the unit test file statjax/tests/test_probit.py with 15 numerical, inference and validation tests
+  - Deepened project-wide comments, integrating the overall design and Probit algorithm document (StatJAX005)
+  - Updated the self-test process document to StatJAX自我测试完整流程_SH_V005.md
 
 ### Version-0.4.1
   - Added the regression component QRLogisticComponent (binary Logistic regression based on IRLS and column-pivoted Householder QR)

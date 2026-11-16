@@ -22,18 +22,18 @@ This is the public class interface of the regression module. It exposes independ
 
     (1) __all__ explicit export
 
-    (2) Unified train / reasoning / _info component interfaces, with algorithm-specific extensions such as Logistic predict_proba
+    (2) Unified train / reasoning / _info component interfaces, with algorithm-specific extensions such as Logistic and Probit predict_proba
 
 - Main functions:
 
-    (1) Open OLS, ridge, LASSO and binary Logistic components
+    (1) Open OLS, ridge, LASSO, binary Logistic and binary Probit components
 
 Usage examples
 --------------
 .. code-block:: python
     :linenos:
 
-    from statjax.regression import HouseholderOLSComponent,SVDRidgeComponent,CDLassoComponent,QRLogisticComponent
+    from statjax.regression import HouseholderOLSComponent,SVDRidgeComponent,CDLassoComponent,QRLogisticComponent,QRProbitComponent
 
     ols_instance = HouseholderOLSComponent()
     x_hat,metrics = ols_instance.train(A=A_train,b=b_train)
@@ -53,6 +53,12 @@ Usage examples
     probabilities = logistic_instance.predict_proba(A_test=A_binary_test)
     y_pred = logistic_instance.reasoning(A_test=A_binary_test)
 
+    ### Probit uses a caller-prepared design matrix containing any intercept column
+    probit_instance = QRProbitComponent()
+    beta_hat,metrics = probit_instance.train(A=A_probit_train,b=b_binary_train)
+    probabilities = probit_instance.predict_proba(A_test=A_probit_test)
+    y_pred = probit_instance.reasoning(A_test=A_probit_test)
+
 Class Description
 -----------------
 (1)TestRegression: This is a regression test placeholder component implementation class, the main function is to verify the framework link, the main technical inheritance
@@ -65,11 +71,15 @@ Class Description
 
 (5)QRLogisticComponent: This is a binary Logistic regression component based on IRLS and column-pivoted Householder QR decomposition, with numerical-rank truncation, Armijo backtracking, probability inference and threshold-based classification
 
+(6)QRProbitComponent: This is a binary Probit regression component based on Fisher scoring and column-pivoted Householder QR decomposition, with explicit numerical-rank failure, Armijo step halving, probability inference and threshold-based classification
+
 References
 ----------
 StatJAX Design Document `"StatJAX Design SH V001"<https://github.com/redblue0216/statjax>`_
 
 StatJAX004 Logistic Design Document `"StatJAX004 Logistic SH V001"<https://github.com/redblue0216/statjax>`_
+
+StatJAX005 Probit Design Document `"StatJAX005 Probit SH V001"<https://github.com/redblue0216/statjax>`_
 
 '''
 
@@ -83,7 +93,7 @@ StatJAX004 Logistic Design Document `"StatJAX004 Logistic SH V001"<https://githu
 ### Basic package
 ### Algorithm package
 ### Project Package - Algorithm Components
-from statjax.regression._components import TestRegression,HouseholderOLSComponent,SVDRidgeComponent,CDLassoComponent,QRLogisticComponent
+from statjax.regression._components import TestRegression,HouseholderOLSComponent,SVDRidgeComponent,CDLassoComponent,QRLogisticComponent,QRProbitComponent
 
 
 
@@ -95,6 +105,7 @@ from statjax.regression._components import TestRegression,HouseholderOLSComponen
 ### ------SVDRidgeComponent
 ### ------CDLassoComponent
 ### ------QRLogisticComponent
+### ------QRProbitComponent
 ###
 ################################################################################################################################################################################
 
@@ -110,7 +121,8 @@ __all__ = [
     "HouseholderOLSComponent",
     "SVDRidgeComponent",
     "CDLassoComponent",
-    "QRLogisticComponent"
+    "QRLogisticComponent",
+    "QRProbitComponent"
 ]
 
 

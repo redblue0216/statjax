@@ -20,20 +20,20 @@ This is a collection of concrete regression and binary-classification implementa
 
 - Key points:
 
-    (1) JAX technology stack (thin QR decomposition, triangular back substitution, thin SVD decomposition, singular value shrinkage, soft thresholding operator, Gauss-Seidel coordinate sweep, rank-1 residual update, IRLS, column-pivoted QR, Armijo backtracking, JIT compilation where shapes permit)
+    (1) JAX technology stack (thin QR decomposition, triangular back substitution, thin SVD decomposition, singular value shrinkage, soft thresholding operator, Gauss-Seidel coordinate sweep, rank-1 residual update, IRLS, Fisher scoring, column-pivoted QR, Armijo backtracking, normal log-CDF, JIT compilation where shapes permit)
 
 - Main functions:
 
     (1) Linear regression, regularized regression and sparse regression
 
-    (2) Binary Logistic probability inference and classification
+    (2) Binary Logistic and Probit probability inference and classification
 
 Usage examples
 --------------
 .. code-block:: python
     :linenos:
 
-    from statjax.regression import HouseholderOLSComponent,SVDRidgeComponent,CDLassoComponent,QRLogisticComponent
+    from statjax.regression import HouseholderOLSComponent,SVDRidgeComponent,CDLassoComponent,QRLogisticComponent,QRProbitComponent
 
     ### Train the OLS model and solve the optimal regression coefficients
     ols_instance = HouseholderOLSComponent()
@@ -60,6 +60,12 @@ Usage examples
     probabilities = logistic_instance.predict_proba(A_test=A_binary_test)
     y_pred = logistic_instance.reasoning(A_test=A_binary_test)
 
+    ### Train Probit on a caller-prepared design matrix containing any intercept column
+    probit_instance = QRProbitComponent()
+    beta_hat,metrics = probit_instance.train(A=A_probit_train,b=b_binary_train)
+    probabilities = probit_instance.predict_proba(A_test=A_probit_test)
+    y_pred = probit_instance.reasoning(A_test=A_probit_test)
+
 Class Description
 -----------------
 (1)TestRegression: This is a regression test placeholder component implementation class, the main function is to verify the framework link, the main technical inheritance
@@ -71,6 +77,8 @@ Class Description
 (4)CDLassoComponent: This is a LASSO regression component implementation class based on coordinate descent, the main function is to solve the L1 regularized sparse optimal regression coefficients and batch prediction, the main technical JAX technology stack (soft thresholding operator, Gauss-Seidel coordinate sweep, rank-1 residual update, lax.fori_loop compiled control flow, JIT compilation)
 
 (5)QRLogisticComponent: This is a binary Logistic regression component based on IRLS and column-pivoted Householder QR decomposition, the main functions are stable L2-regularized training, numerical-rank truncation, Armijo-protected updates, two-class probability inference and threshold-based classification
+
+(6)QRProbitComponent: This is a binary Probit regression component based on Fisher scoring and column-pivoted Householder QR decomposition, the main functions are stable unregularized maximum-likelihood training, explicit numerical-rank failure, Armijo-protected updates, normal-CDF probability inference and threshold-based classification
 
 References
 ----------
@@ -90,6 +98,8 @@ References
 
 - [Logistic regression](https://en.wikipedia.org/wiki/Logistic_regression)
 
+- [Probit model](https://en.wikipedia.org/wiki/Probit_model)
+
 - [Iteratively reweighted least squares](https://en.wikipedia.org/wiki/Iteratively_reweighted_least_squares)
 
 - [Backtracking line search](https://en.wikipedia.org/wiki/Backtracking_line_search)
@@ -101,6 +111,8 @@ References
 - StatJAX003 LASSO Design Document `"StatJAX003 LASSO SH V001"<https://github.com/redblue0216/statjax>`_
 
 - StatJAX004 Logistic Design Document `"StatJAX004 Logistic SH V001"<https://github.com/redblue0216/statjax>`_
+
+- StatJAX005 Probit Design Document `"StatJAX005 Probit SH V001"<https://github.com/redblue0216/statjax>`_
 '''
 
 
@@ -115,8 +127,10 @@ from statjax.regression._base import BaseRegression
 ### Algorithm package
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax import lax
 from jax.scipy.linalg import qr,solve_triangular
+from jax.scipy.stats import norm
 from jax.numpy.linalg import lstsq
 ### Project Package - Algorithm Components
 
@@ -143,7 +157,10 @@ jax.config.update("jax_enable_x64",True)
 ###
 ### class:QRLogisticComponent
 ### ------This is a binary Logistic regression component based on IRLS and column-pivoted Householder QR decomposition, with numerical-rank truncation, Armijo backtracking, two-class probability inference and threshold-based classification
-### 
+###
+### class:QRProbitComponent
+### ------This is a binary Probit regression component based on Fisher scoring and column-pivoted Householder QR decomposition, with explicit numerical-rank failure, Armijo step halving, normal-CDF probability inference and threshold-based classification
+###
 ################################################################################################################################################################################
 
 
@@ -1822,6 +1839,653 @@ class QRLogisticComponent(BaseRegression):
         '''
 
         return "QRLogisticComponent: binary Logistic regression component based on IRLS and column-pivoted Householder QR decomposition, implemented with the JAX technology stack"
+
+
+
+##############################################################################################################################################################################
+##############################################################################################################################################################################
+
+
+
+### Tail protection applies only to IRLS scores and weights; the statistical likelihood always uses original eta
+_PROBIT_ETA_TAIL = 30.0
+
+
+@jax.jit
+def _probit_loglik(beta,X,y):
+    '''Method Function:
+
+        Define the stable total Probit log-likelihood using normal log-CDF values:
+        $ell(beta)=sum_i[y_i*log(Phi(eta_i))+(1-y_i)*log(Phi(-eta_i))]$ (ℓ(β) = Σᵢ[yᵢlogΦ(ηᵢ)+(1−yᵢ)logΦ(−ηᵢ)])
+
+    :parameters:
+        - beta (jnp.ndarray) - (p,) Probit regression coefficients
+        - X (jnp.ndarray) - (n,p) Design matrix, including any intercept column
+        - y (jnp.ndarray) - (n,) Binary observation labels
+
+    :return:
+        - loglik (jnp.ndarray) - Scalar total log-likelihood
+    '''
+
+    ### Linear predictor eta = X @ beta
+    eta = X @ beta
+    ### Stable symmetric log-CDF form avoids log(0), tail underflow and log(1-p) cancellation
+    log_p = norm.logcdf(eta)
+    log_q = norm.logcdf(-eta)
+    loglik = jnp.sum(y * log_p + (1.0 - y) * log_q)
+
+    return loglik
+
+
+@jax.jit
+def _probit_mean_nll(beta,X,y):
+    '''Method Function:
+
+        Define the mean negative Probit log-likelihood $-ell(beta)/n$ (−ℓ(β)/n) for evaluation and independent automatic differentiation checks
+
+    :parameters:
+        - beta (jnp.ndarray) - (p,) Probit regression coefficients
+        - X (jnp.ndarray) - (n,p) Design matrix
+        - y (jnp.ndarray) - (n,) Binary observation labels
+
+    :return:
+        - loss (jnp.ndarray) - Scalar mean negative log-likelihood
+    '''
+
+    ### Keep mean NLL distinct from the total log-likelihood used by Armijo acceptance
+    loss = -_probit_loglik(beta,X,y) / X.shape[0]
+
+    return loss
+
+
+def _probit_score_and_weights(beta,X,y):
+    '''Method Function:
+
+        Define the per-observation score vector and Fisher weights:
+        $u_i=y_i*phi_i/p_i-(1-y_i)*phi_i/q_i$ (uᵢ = yᵢφᵢ/pᵢ−(1−yᵢ)φᵢ/qᵢ) and $w_i=phi_i^2/(p_i*q_i)$ (wᵢ = φᵢ²/(pᵢqᵢ)). Tail protection applies only to these IRLS calculations
+
+    :parameters:
+        - beta (jnp.ndarray) - (p,) Probit regression coefficients
+        - X (jnp.ndarray) - (n,p) Design matrix
+        - y (jnp.ndarray) - (n,) Binary observation labels
+
+    :return:
+        - u (jnp.ndarray) - (n,) Score vector with respect to linear predictors
+        - w (jnp.ndarray) - (n,) Diagonal Fisher information weights
+    '''
+
+    eta = X @ beta
+    ### Limit extreme IRLS derivatives without replacing the original likelihood argument
+    eta_safe = jnp.clip(eta,-_PROBIT_ETA_TAIL,_PROBIT_ETA_TAIL)
+    log_phi = norm.logpdf(eta_safe)
+    log_p = norm.logcdf(eta_safe)
+    log_q = norm.logcdf(-eta_safe)
+
+    ### Evaluate inverse Mills ratios and Fisher weights in the log domain
+    lambda_pos = jnp.exp(log_phi - log_p)
+    lambda_neg = jnp.exp(log_phi - log_q)
+    u = y * lambda_pos - (1.0 - y) * lambda_neg
+    log_w = 2.0 * log_phi - log_p - log_q
+    w = jnp.exp(log_w)
+
+    return u,w
+
+
+@jax.jit
+def _probit_nll_gradient(beta,X,y):
+    '''Method Function:
+
+        Define the analytic gradient of mean negative Probit log-likelihood:
+        $gradient=-(X^T@u)/n$ (gradient = −Xᵀu/n). JAX automatic differentiation independently checks this expression in the unit tests
+
+    :parameters:
+        - beta (jnp.ndarray) - (p,) Probit regression coefficients
+        - X (jnp.ndarray) - (n,p) Design matrix
+        - y (jnp.ndarray) - (n,) Binary observation labels
+
+    :return:
+        - gradient (jnp.ndarray) - (p,) Analytic mean negative log-likelihood gradient
+    '''
+
+    u,_ = _probit_score_and_weights(beta,X,y)
+    gradient = -(X.T @ u) / X.shape[0]
+
+    return gradient
+
+
+@jax.jit
+def _probit_irls_qr_step(beta,X,y):
+    '''Method Function:
+
+        Define one Fisher-scoring increment using weighted least squares and column-pivoted Householder QR. With $Xw=sqrt(W)*X$ and $h=u/sqrt(w)$ (Xw = √W·X, h = u/√W), solving $min_delta||Xw@delta-h||_2^2$ (min_δ‖Xwδ−h‖₂²) is equivalent to $(X^T*W*X)@delta=X^T@u$ ((XᵀWX)δ = Xᵀu), without forming normal equations or a working response
+
+    :parameters:
+        - beta (jnp.ndarray) - (p,) Current Probit regression coefficients
+        - X (jnp.ndarray) - (n,p) Design matrix
+        - y (jnp.ndarray) - (n,) Binary observation labels
+
+    :return:
+        - delta (jnp.ndarray) - (p,) Fisher-scoring parameter increment
+        - rank (jnp.ndarray) - Estimated numerical rank of the weighted design matrix
+        - grad_inf (jnp.ndarray) - Infinity norm of the mean log-likelihood gradient
+        - slope (jnp.ndarray) - Total log-likelihood directional derivative
+        - qr_error (jnp.ndarray) - Relative QR reconstruction error
+    '''
+
+    ### Step 1: construct weighted rows by broadcasting, without materializing W
+    u,w = _probit_score_and_weights(beta,X,y)
+    sqrt_w = jnp.sqrt(w)
+    Xw = X * sqrt_w[:,None]
+    h = u / sqrt_w
+
+    ### Step 2: economic column-pivoted Householder QR uses Xw[:,piv] = Q @ R
+    Q,R,piv = qr(Xw,mode="economic",pivoting=True,check_finite=False)
+    diag_r = jnp.abs(jnp.diag(R))
+    eps = jnp.finfo(X.dtype).eps
+    ### Engineering rank threshold tau = max(n,p)*eps*|R[0,0]|
+    rank_tol = max(X.shape) * eps * diag_r[0]
+    rank = jnp.sum(diag_r > rank_tol)
+
+    ### Step 3: solve the permuted upper triangular system and restore original parameter order
+    delta_piv = solve_triangular(R,Q.T @ h,lower=False,check_finite=False)
+    delta = jnp.zeros_like(beta).at[piv].set(delta_piv)
+
+    ### Step 4: use mean gradient for scale-free convergence and total slope for Armijo
+    grad = X.T @ u
+    grad_inf = jnp.linalg.norm(grad / X.shape[0],ord=jnp.inf)
+    slope = grad @ delta
+    qr_error = jnp.linalg.norm(Xw[:,piv] - Q @ R) / jnp.linalg.norm(Xw)
+
+    return delta,rank,grad_inf,slope,qr_error
+
+
+def _fit_qr_probit(X,y,max_iter,grad_tol,step_tol,ll_tol,max_halvings):
+    '''Method Function:
+
+        Define Probit training through Fisher scoring, column-pivoted QR and Armijo step halving. Accepted steps satisfy $ell(beta+alpha*delta)>=ell(beta)+1e-4*alpha*g^T*delta$ (ℓ(β+αδ) ≥ ℓ(β)+10⁻⁴αgᵀδ). The host loop preserves explicit rank, direction and convergence decisions
+
+    :parameters:
+        - X (jnp.ndarray) - (n,p) Validated design matrix
+        - y (jnp.ndarray) - (n,) Validated binary labels
+        - max_iter (int) - Maximum number of Fisher-scoring iterations
+        - grad_tol (float) - Mean gradient infinity-norm convergence tolerance
+        - step_tol (float) - Relative parameter-step convergence tolerance
+        - ll_tol (float) - Relative log-likelihood-change convergence tolerance
+        - max_halvings (int) - Maximum number of Armijo step-halving attempts
+
+    :return:
+        - result (dict) - Trained parameters, convergence state and optimization diagnostics
+    '''
+
+    ### Step 1: zero initialization gives eta=0 and p=q=1/2; history includes initial likelihood
+    beta = jnp.zeros(X.shape[1],dtype=jnp.float64)
+    ll = float(_probit_loglik(beta,X,y))
+    loglik_history = [ll]
+    converged = False
+    n_iter = 0
+
+    for iteration in range(1,max_iter + 1):
+        ### Step 2: obtain the Fisher/QR increment and synchronize scalar diagnostics with the host
+        delta,rank,grad_inf,slope,qr_error = _probit_irls_qr_step(beta,X,y)
+        rank,grad_inf,slope,qr_error = map(float,(rank,grad_inf,slope,qr_error))
+
+        ### Step 3: rank deficiency is an explicit modeling error, never silent coefficient truncation
+        if rank < X.shape[1]:
+            raise np.linalg.LinAlgError(
+                f"Weighted design matrix has numerical rank {rank} < {X.shape[1]}; "
+                "remove redundant columns or use an explicitly regularized model"
+            )
+        if qr_error > 1e-10:
+            raise RuntimeError(f"QR reconstruction check failed with relative error {qr_error:.3e}")
+        ### Step 4: mean gradient is the primary first-order convergence criterion
+        if grad_inf < grad_tol:
+            converged = True
+            n_iter = iteration - 1
+            break
+        if not np.isfinite(slope) or slope <= 0.0:
+            raise RuntimeError(f"IRLS direction is not a finite ascent direction: g^T delta={slope}")
+
+        ### Step 5: try the full Fisher step before Armijo step halving
+        accepted = False
+        step = 1.0
+        for _ in range(max_halvings + 1):
+            candidate = beta + step * delta
+            candidate_ll = float(_probit_loglik(candidate,X,y))
+            ### Sufficient ascent uses total log-likelihood and total directional derivative
+            if np.isfinite(candidate_ll) and candidate_ll >= ll + 1e-4 * step * slope:
+                accepted = True
+                break
+            step *= 0.5
+        if not accepted:
+            raise RuntimeError("Armijo step halving failed to find an acceptable Probit update")
+
+        ### Step 6: accept the update and record monotone-likelihood and relative-change diagnostics
+        step_inf = float(jnp.max(jnp.abs(step * delta)))
+        beta,ll = candidate,candidate_ll
+        loglik_history.append(ll)
+        n_iter = iteration
+        ll_change = abs(loglik_history[-1] - loglik_history[-2]) / max(1.0,abs(loglik_history[-2]))
+        beta_scale = float(jnp.max(jnp.abs(beta)))
+
+        ### Step 7: small step and likelihood change are necessary but not sufficient; recheck gradient
+        if step_inf <= step_tol * (1.0 + beta_scale) and ll_change <= ll_tol:
+            final_grad = float(jnp.linalg.norm(_probit_nll_gradient(beta,X,y),ord=jnp.inf))
+            if final_grad < grad_tol:
+                grad_inf = final_grad
+                converged = True
+                break
+
+    ### Recompute the final gradient at zero-iteration convergence, iteration limit or non-convergence
+    if converged and n_iter == 0:
+        grad_inf = float(jnp.linalg.norm(_probit_nll_gradient(beta,X,y),ord=jnp.inf))
+    elif not converged or n_iter == max_iter:
+        grad_inf = float(jnp.linalg.norm(_probit_nll_gradient(beta,X,y),ord=jnp.inf))
+
+    return {
+        "beta_hat": beta,
+        "loglik_history": loglik_history,
+        "converged": converged,
+        "n_iter": n_iter,
+        "grad_inf": float(grad_inf)
+    }
+
+
+@jax.jit
+def _predict_probit_proba(A_test,beta_hat):
+    '''Method Function:
+
+        Define JIT-compiled Probit probability inference using $p1=Phi(A_test@beta_hat)$ (p₁ = Φ(A_testβ̂)) and returning [1-p1,p1]
+
+    :parameters:
+        - A_test (jnp.ndarray) - (m,p) Test design matrix with training column order
+        - beta_hat (jnp.ndarray) - (p,) Trained Probit regression coefficients
+
+    :return:
+        - probabilities (jnp.ndarray) - (m,2) Negative-class and positive-class probabilities
+    '''
+
+    ### Positive probability is a normal CDF prediction, not a latent-variable prediction
+    positive = norm.cdf(A_test @ beta_hat)
+    probabilities = jnp.stack([1.0 - positive,positive],axis=1)
+
+    return probabilities
+
+
+class QRProbitComponent(BaseRegression):
+    '''Class Introduction:
+
+        This is a binary Probit regression component based on iteratively reweighted least squares (IRLS), Fisher scoring, column-pivoted Householder QR decomposition and Armijo step halving. The main functions are unregularized maximum-likelihood training, numerical-rank diagnostics, two-class probability inference and threshold-based classification. It is intended for small and medium dense data, teaching, algorithm verification and numerically transparent reference workflows. The input design matrix must contain any required intercept column
+
+    Mathematical principle
+    ----------------------
+    (1) Binary Probit model: given n samples and p columns, the inputs are $X in R^(n*p)$ and $y in {0,1}^n$ (X ∈ R^(n×p), y ∈ {0,1}ⁿ). The caller controls column order and includes a constant column when an intercept is required. For observation i:
+
+        $eta_i = x_i^T*beta , p_i = P(y_i=1|x_i,beta) = Phi(eta_i)$
+        ηᵢ = xᵢᵀβ, pᵢ = P(yᵢ=1|xᵢ,β) = Φ(ηᵢ)
+
+        $Phi(t) = integral_{-infinity}^{t} phi(s)*ds , phi(t) = exp(-t^2/2)/sqrt(2*pi)$
+        Φ(t) = ∫₋∞ᵗφ(s)ds, φ(t) = exp(−t²/2)/√(2π), where Φ and φ are the standard normal CDF and PDF
+
+        The equivalent latent-variable model is $y_i^*=x_i^T*beta+epsilon_i$ (yᵢ* = xᵢᵀβ+εᵢ), $epsilon_i~N(0,1)$ (εᵢ ~ N(0,1)), and $y_i=1(y_i^*>0)$ (yᵢ = 1(yᵢ*>0)). Fixing the error variance to 1 identifies the parameter scale; otherwise beta and the error scale cannot both be identified
+
+    (2) Stable log-likelihood and concavity: the component maximizes
+
+        $ell(beta) = sum_i[y_i*log(Phi(eta_i))+(1-y_i)*log(Phi(-eta_i))]$
+        ℓ(β) = Σᵢ[yᵢlogΦ(ηᵢ)+(1−yᵢ)logΦ(−ηᵢ)]
+
+        Both logΦ(η) and logΦ(−η) are concave, so the Probit log-likelihood is concave in beta. It is strictly concave with a unique maximizer when X has full column rank and a finite maximum exists. norm.logcdf(eta) and norm.logcdf(-eta) avoid evaluating log(0) after CDF underflow and avoid catastrophic cancellation in log(1-Phi(eta)). The likelihood always uses the original eta, never the clipped IRLS value
+
+    (3) Score vector and Fisher information: let $p_i=Phi(eta_i)$, $q_i=Phi(-eta_i)$ and $phi_i=phi(eta_i)$ (pᵢ = Φ(ηᵢ), qᵢ = Φ(−ηᵢ), φᵢ = φ(ηᵢ)). The per-observation score with respect to eta is
+
+        $u_i = y_i*phi_i/p_i-(1-y_i)*phi_i/q_i = phi_i*(y_i-p_i)/(p_i*q_i)$
+        uᵢ = yᵢφᵢ/pᵢ−(1−yᵢ)φᵢ/qᵢ = φᵢ(yᵢ−pᵢ)/(pᵢqᵢ)
+
+        $g(beta) = X^T*u , w_i = phi_i^2/(p_i*q_i) , A = X^T*W*X$
+        g(β) = Xᵀu, wᵢ = φᵢ²/(pᵢqᵢ), A = XᵀWX, where W = diag(wᵢ)
+
+        Fisher scoring solves $A*delta=g$ (Aδ = g) and updates $beta^+=beta+delta$ (β⁺ = β+δ). For nonzero g and positive definite A, $g^T*delta=g^T*A^(-1)*g>0$ (gᵀδ = gᵀA⁻¹g > 0), so delta is an ascent direction. Probit is not a canonical-link Bernoulli model: Fisher scoring is not generally the same as Newton's method with the observed Hessian
+
+    (4) Log-domain scores and tail protection: inverse Mills ratios and weights are evaluated as
+
+        $phi_i/p_i = exp(log(phi_i)-log(p_i)) , phi_i/q_i = exp(log(phi_i)-log(q_i))$
+        φᵢ/pᵢ = exp(logφᵢ−logpᵢ), φᵢ/qᵢ = exp(logφᵢ−logqᵢ)
+
+        $w_i = exp(2*log(phi_i)-log(p_i)-log(q_i))$
+        wᵢ = exp(2logφᵢ−logpᵢ−logqᵢ)
+
+        Only these IRLS calculations use $eta_safe=clip(eta,-30,30)$ (η_safe = clip(η,−30,30)). This limits numerical underflow and overflow but makes extreme-tail derivatives approximate; it is not a universal remedy for separation or misspecification
+
+    (5) Incremental IRLS as weighted least squares: classical IRLS can use the working response $z_i=eta_i+(y_i-p_i)/phi_i$ (zᵢ = ηᵢ+(yᵢ−pᵢ)/φᵢ), but z can become extreme. Instead, define $X_w=W^(1/2)*X$ and $h=W^(-1/2)*u$ (X_w = W¹ᐟ²X, h = W⁻¹ᐟ²u), then solve
+
+        $min_delta ||X_w*delta-h||_2^2$
+        min_δ ‖X_wδ−h‖₂²
+
+        Its normal equations are $X_w^T*X_w*delta=X_w^T*h$ (X_wᵀX_wδ = X_wᵀh), exactly equivalent to $X^T*W*X*delta=X^T*u$ (XᵀWXδ = Xᵀu). The implementation forms neither the n×n matrix W nor the p×p Fisher matrix, and never constructs z
+
+    (6) Householder QR and column pivoting: a Householder reflection $H=I-2*v*v^T/(v^T*v)$ (H = I−2vvᵀ/(vᵀv)) is symmetric and orthogonal. Column-pivoted economic QR computes
+
+        $X_w*P = Q*R , X_w[:,piv] = Q*R$
+        X_wP = QR, equivalently X_w[:,piv] = QR
+
+        The implementation solves $R*delta_piv=Q^T*h$ (Rδ_piv = Qᵀh) by triangular back substitution and restores the original parameter order with .at[piv].set(...). Orthogonal transformations avoid the condition-number squaring caused by explicitly forming X_wᵀX_w
+
+        Numerical rank is estimated by $|R_jj| > max(n,p)*eps*|R_00|$ (|Rⱼⱼ| > max(n,p)·ε·|R₀₀|). If rank < p, training raises an explicit linear-algebra exception. Pivoted QR is a useful rank-revealing diagnostic, not an absolute rank guarantee or an SVD minimum-norm solver
+
+    (7) Why IRLS + column-pivoted QR: the method is selected for numerical transparency and stability, not because it is fastest at every scale:
+
+        ==================  ================================  ==========================================  ==================================
+        Method              Main per-iteration work            Numerical/storage property               Typical scenario
+        ==================  ================================  ==========================================  ==================================
+        Normal equations    XᵀWX plus Cholesky                 Condition number is squared               Well-conditioned full-rank data
+        Ordinary QR         Weighted economic QR               Stable but weaker rank diagnostics        Full-rank weighted least squares
+        IRLS + pivoted QR   Weighted QR, about O(n*p^2), n>=p  No Hessian inverse; rank diagnostics      Dense reference and collinearity checks
+        IRLS + SVD          Usually higher decomposition cost  Full spectrum and minimum-norm options    Severe rank deficiency diagnostics
+        First-order methods Matrix-vector products             Lower per-step cost; no Fisher curvature   Larger parameter dimensions
+        ==================  ================================  ==========================================  ==================================
+
+        For n>=p dense data, each iteration costs approximately O(n*p^2) for economic QR, O(n*p) for weighted rows and O(p^2+n*p) for back substitution and vector operations. Storage is approximately O(n*p+p^2), depending on the backend
+
+    (8) Armijo sufficient ascent: a full Fisher step is tried first, followed by alpha in {1,1/2,1/4,...}. A candidate is accepted only when
+
+        $ell(beta+alpha*delta) >= ell(beta)+c*alpha*g^T*delta , c=1e-4$
+        ℓ(β+αδ) ≥ ℓ(β)+cαgᵀδ, c = 10⁻⁴
+
+        Non-finite candidates, non-ascent directions and failed backtracking are reported explicitly. Concavity alone does not make step-size control unnecessary under finite precision
+
+    (9) Convergence criteria: the primary first-order condition is $||g||_inf/n < grad_tol$ (‖g‖∞/n < grad_tol), with default grad_tol=1e-8. After an update, the component also checks
+
+        $||alpha*delta||_inf <= step_tol*(1+||beta||_inf)$
+        ‖αδ‖∞ ≤ step_tol·(1+‖β‖∞), default step_tol=1e-9
+
+        $|ell^+-ell|/max(1,|ell|) <= ll_tol$
+        |ℓ⁺−ℓ|/max(1,|ℓ|) ≤ ll_tol, default ll_tol=1e-11
+
+        Stable steps and likelihood alone are insufficient: the gradient is checked again before declaring convergence. Reaching max_iter=100 returns converged=False rather than reporting false success
+
+    Algorithm flow
+    --------------
+    .. code-block:: text
+
+        Input X(n×p), y(n,), optimization controls and threshold
+            |
+            v
+        Validate float64, binary finite inputs, n>=p and caller-defined columns
+            |
+            v
+        Initialize beta = 0 -> eta = 0 -> p = q = 1/2 -> record ell(beta)
+            |
+            v
+        Compute log(phi), log(p), log(q) -> score u and Fisher weights w
+            |
+            v
+        Build Xw = sqrt(w)[:,None]*X and h = u/sqrt(w)
+            |
+            v
+        Column-pivoted economic Householder QR: Xw[:,piv] = Q*R
+            |
+            v
+        Estimate numerical rank -> stop if rank < p -> triangular solve for delta
+            |
+            v
+        Check QR reconstruction, ||g||inf/n and g.T*delta > 0
+            |
+            v
+        Armijo step halving -> beta = beta + alpha*delta -> record likelihood
+            |
+            +------------> Joint step / likelihood / gradient convergence checks
+            |
+            v
+        Inference: p1 = Phi(X_new*beta_hat)
+            |
+            +------------> predict_proba: [1-p1,p1]; reasoning: p1 >= threshold
+
+    Step 1 (input and precision): convert inputs to float64, require A(n,p) and b(n,) with matching non-empty samples, finite values, binary labels and n>=p. The module enables jax_enable_x64 before component arrays are created
+
+    Step 2 (design matrix responsibility): include an intercept and perform any desired preprocessing before calling train. Reuse exactly the same column order and training-derived preprocessing during inference; this component does not estimate mean or scale statistics
+
+    Step 3 (initialization): set beta=0. All initial probabilities are 0.5, scores and Fisher weights are moderate, and the initial total log-likelihood is recorded for monotonicity checks
+
+    Step 4 (stable scores and weights): calculate eta, clip only the IRLS copy to [-30,30], and evaluate normal log-PDF/log-CDF values. Exponentiate log-domain ratios to obtain u and w without forming W
+
+    Step 5 (weighted rows): construct Xw and h by broadcasting sqrt(w). This encodes the Fisher system without a working response or explicit normal equations
+
+    Step 6 (pivoted QR): call jax.scipy.linalg.qr(Xw,mode="economic",pivoting=True). Economic QR avoids unnecessary full-Q dimensions and Householder transformations provide stable orthogonal factorization
+
+    Step 7 (rank and triangular solve): estimate numerical rank from diag(R), stop on rank deficiency, solve R by back substitution, and restore delta to original column order using immutable indexed assignment
+
+    Step 8 (diagnostics): compute mean gradient infinity norm, total-likelihood directional derivative and relative QR reconstruction error. Rank, direction and decomposition failures are not silently accepted
+
+    Step 9 (Armijo update): try the full step and halve until sufficient ascent is achieved or max_halvings is exhausted. The accepted likelihood is appended to history
+
+    Step 10 (convergence): stop immediately when the mean gradient meets grad_tol. Otherwise require small relative step and likelihood change, then recheck the gradient; continue if the gradient is still too large
+
+    Step 11 (probability inference): compute $p1=Phi(A_test*beta_hat)$ (p₁ = Φ(A_testβ̂)). predict_proba returns [1-p1,p1] with shape (m,2), and each row sums to 1
+
+    Step 12 (class inference): reasoning returns int32 values 0 or 1 according to p1>=threshold. The threshold changes only the decision rule, not the trained probability model
+
+    JAX unique advantages
+    ---------------------
+    (1) Explicit float64 and vectorized matrix computation: repeated QR, tail weights and small likelihood changes benefit from float64. Matrix products and row weighting avoid Python sample loops and n×n diagonal weight allocation
+
+    (2) Selective JIT compilation: the stable likelihood, mean NLL, analytic gradient, fixed-shape Fisher/QR step and probability inference use @jax.jit. The outer training loop deliberately remains in Python for clear rank exceptions, Armijo control and convergence diagnostics
+
+    (3) Automatic differentiation as an independent checker: training directions come from Fisher scoring and QR rather than gradient descent, while jax.grad can independently verify the analytic gradient:
+
+    .. code-block:: python
+
+        import jax
+        from statjax.regression._components import _probit_mean_nll,_probit_nll_gradient
+
+        manual = _probit_nll_gradient(beta,X,y)
+        automatic = jax.grad(_probit_mean_nll)(beta,X,y)
+        relative_error = jax.numpy.linalg.norm(manual-automatic) / (1.0+jax.numpy.linalg.norm(automatic))
+
+    (4) Immutable functional updates: .at[piv].set(...) restores the permuted Fisher increment without in-place array mutation, preserving JAX array semantics and making data dependencies explicit
+
+    (5) Reproducible verification: tests generate train and test data from independent explicit PRNGKey values. Cross-version, backend or hardware bitwise identity is not assumed, especially when pivots tie or diagonal values approach the rank threshold
+
+    (6) Backend migration with explicit boundaries: matrix operations can run on supported JAX backends, but pivoted QR support, performance and determinism must be verified per backend. CPU is the reference environment. float(...) conversions synchronize with the host; throughput benchmarks must use block_until_ready()
+
+    Precautions
+    -----------
+    (1) QR is not universally fastest: every iteration performs a matrix decomposition. Assess iterative or first-order optimizers for high-dimensional, sparse or very large workloads
+
+    (2) Never explicitly invert Fisher information: inverse notation is mathematical shorthand. The implementation solves weighted least squares through QR and triangular back substitution
+
+    (3) Never compute log(Phi(eta)) by evaluating Phi first: stable norm.logcdf is required in both tails. The likelihood uses original eta even though IRLS derivatives use tail protection
+
+    (4) Fisher scoring is not exact Newton: w_i=phi_i^2/(p_i*q_i) defines expected Fisher information, not generally the observed Hessian
+
+    (5) Rank deficiency is an error by design: remove redundant columns or define an explicitly regularized model. This component does not silently truncate coefficients or return an arbitrary basic solution
+
+    (6) Complete separation can make unregularized maximum-likelihood parameters diverge: inspect converged, coefficient norms and likelihood history; QR and backtracking cannot create a finite MLE that does not exist
+
+    (7) ETA tail protection is approximate: frequent activation at |eta|>30 calls for stable asymptotic inverse Mills ratios and data/model review, not merely a larger clip range
+
+    (8) Keep n>=p and use dense inputs: high-dimensional p>n, sparse massive data and streaming data require a different solver or an explicitly changed statistical objective
+
+    (9) Standardization is a caller responsibility: if used, estimate statistics on training data only and reuse them for inference. Preserve intercept placement and feature order
+
+    (10) Python loops cause host synchronization: this is an intentional reference-implementation boundary, not a maximum-throughput design. End-to-end device-resident control would require a separate failure-state protocol
+
+    (11) Regularization changes the estimand: adding a penalty requires corresponding changes to the Fisher system and gradient. Adding jitter only to R would not be equivalent to ordinary Probit MLE
+
+    (12) Standard errors are not provided: a future implementation could estimate covariance from final Fisher information using linear solves and correct pivot restoration, without explicit inversion
+
+    (13) Accuracy is not a sufficient correctness test: retain gradient, QR reconstruction, rank, monotone likelihood, parameter, probability-range, NLL and Brier checks
+
+    (14) Production use needs additional engineering: serialization, stronger schema checks, outlier handling, threshold calibration and genuine cross-validation are outside this component's current scope
+
+    :example:
+        >>> import jax
+        >>> import jax.numpy as jnp
+        >>> from jax.scipy.stats import norm
+        >>> from statjax.regression import QRProbitComponent
+        >>> # Generate reproducible Probit data with an explicit intercept column
+        >>> x_key,y_key = jax.random.split(jax.random.PRNGKey(2026))
+        >>> x = jax.random.normal(x_key,(400,4),dtype=jnp.float64)
+        >>> A = jnp.concatenate([jnp.ones((400,1),dtype=jnp.float64),x],axis=1)
+        >>> beta_true = jnp.array([0.4,0.8,-0.6,0.5,-0.3],dtype=jnp.float64)
+        >>> b = jax.random.bernoulli(y_key,norm.cdf(A@beta_true)).astype(jnp.float64)
+        >>> # Train unregularized Probit MLE and perform probability/class inference
+        >>> probit_instance = QRProbitComponent()
+        >>> beta_hat,metrics = probit_instance.train(A=A,b=b)
+        >>> probabilities = probit_instance.predict_proba(A_test=A[:10])
+        >>> y_pred = probit_instance.reasoning(A_test=A[:10])
+        >>> brier = jnp.mean((probabilities[:,1]-b[:10])**2)
+
+    :reference:
+        - [Probit model](https://en.wikipedia.org/wiki/Probit_model)
+        - [Iteratively reweighted least squares](https://en.wikipedia.org/wiki/Iteratively_reweighted_least_squares)
+        - [Householder transformation](https://en.wikipedia.org/wiki/Householder_transformation)
+        - [QR decomposition](https://en.wikipedia.org/wiki/QR_decomposition)
+        - [Backtracking line search](https://en.wikipedia.org/wiki/Backtracking_line_search)
+        - StatJAX005 Probit Design Document `"StatJAX005 Probit SH V001"<https://github.com/redblue0216/statjax>`_
+    '''
+
+    def __init__(self,max_iter=100,grad_tol=1e-8,step_tol=1e-9,ll_tol=1e-11,max_halvings=30,threshold=0.5):
+        '''Attribute Function:
+
+            Define an initialization method for Probit optimization controls, classification threshold and trained model state
+
+        :parameters:
+            - max_iter (int) - Maximum number of Fisher-scoring iterations
+            - grad_tol (float) - Mean gradient infinity-norm convergence tolerance
+            - step_tol (float) - Relative parameter-step convergence tolerance
+            - ll_tol (float) - Relative log-likelihood-change convergence tolerance
+            - max_halvings (int) - Maximum number of Armijo step-halving attempts
+            - threshold (float) - Positive-class decision threshold in [0,1]
+        '''
+
+        ### Validate host-side optimization controls before any numerical training begins
+        if not isinstance(max_iter,int) or isinstance(max_iter,bool) or max_iter < 1:
+            raise ValueError("max_iter must be a positive integer")
+        if not 0.0 < grad_tol < float("inf"):
+            raise ValueError("grad_tol must be finite and positive")
+        if not 0.0 < step_tol < float("inf"):
+            raise ValueError("step_tol must be finite and positive")
+        if not 0.0 < ll_tol < float("inf"):
+            raise ValueError("ll_tol must be finite and positive")
+        if not isinstance(max_halvings,int) or isinstance(max_halvings,bool) or max_halvings < 1:
+            raise ValueError("max_halvings must be a positive integer")
+        if not 0.0 <= threshold <= 1.0:
+            raise ValueError("threshold must be in [0,1]")
+
+        self.max_iter = max_iter
+        self.grad_tol = grad_tol
+        self.step_tol = step_tol
+        self.ll_tol = ll_tol
+        self.max_halvings = max_halvings
+        self.threshold = threshold
+        ### None means that training has not produced coefficients or diagnostics
+        self.beta_hat = None
+        self.metrics = None
+
+
+    def train(self,A,b):
+        '''Method Function:
+
+            Define a training method for unregularized binary Probit maximum-likelihood estimation. The caller owns intercept placement, preprocessing and column order
+
+        :parameters:
+            - A (jnp.ndarray) - (n,p) Training design matrix, including any intercept column
+            - b (jnp.ndarray) - (n,) Binary training labels containing only 0 and 1
+
+        :return:
+            - beta_hat (jnp.ndarray) - (p,) Trained Probit regression coefficients
+            - metrics (dict) - Log-likelihood history, convergence state, iteration count and final gradient norm
+        '''
+
+        ### Convert to float64 and reject malformed or statistically incompatible inputs before JIT calls
+        A = jnp.asarray(A,dtype=jnp.float64)
+        b = jnp.asarray(b,dtype=jnp.float64)
+        if A.ndim != 2 or b.ndim != 1 or A.shape[0] != b.shape[0]:
+            raise ValueError("A must have shape (n,p), b must have shape (n,), and their sample counts must match")
+        if A.shape[0] == 0 or A.shape[1] == 0:
+            raise ValueError("A and b must be non-empty and A must contain at least one column")
+        if A.shape[0] < A.shape[1]:
+            raise ValueError("QRProbitComponent requires n >= p")
+        if not bool(jnp.all(jnp.isfinite(A))) or not bool(jnp.all(jnp.isfinite(b))):
+            raise ValueError("A and b must contain only finite values")
+        if not bool(jnp.all((b == 0.0) | (b == 1.0))):
+            raise ValueError("b must contain only binary labels 0 and 1")
+
+        ### Fisher scoring + pivoted QR + Armijo; no automatic intercept, scaling or regularization
+        result = _fit_qr_probit(
+            A,b,self.max_iter,self.grad_tol,self.step_tol,self.ll_tol,self.max_halvings
+        )
+        ### Store coefficients and diagnostics for subsequent inference and convergence review
+        self.beta_hat = result["beta_hat"]
+        self.metrics = {
+            "initial_loglik": result["loglik_history"][0],
+            "final_loglik": result["loglik_history"][-1],
+            "loglik_history": result["loglik_history"],
+            "converged": result["converged"],
+            "n_iter": result["n_iter"],
+            "grad_inf": result["grad_inf"]
+        }
+
+        return self.beta_hat,self.metrics
+
+
+    def predict_proba(self,A_test):
+        '''Method Function:
+
+            Define a probability inference method using the trained Probit coefficients and the caller-consistent design columns
+
+        :parameters:
+            - A_test (jnp.ndarray) - (m,p) Test design matrix with training column order
+
+        :return:
+            - probabilities (jnp.ndarray) - (m,2) Columns [P(y=0|x),P(y=1|x)]
+        '''
+
+        ### Both inference interfaces require a successfully populated parameter state
+        if self.beta_hat is None:
+            raise RuntimeError("QRProbitComponent has not been trained yet, please call the train method first")
+
+        A_test = jnp.asarray(A_test,dtype=jnp.float64)
+        if A_test.ndim != 2 or A_test.shape[1] != self.beta_hat.shape[0]:
+            raise ValueError("A_test must have shape (m,p) with the same column dimension as training data")
+        if not bool(jnp.all(jnp.isfinite(A_test))):
+            raise ValueError("A_test must contain only finite values")
+
+        ### Fixed-shape normal-CDF inference is JIT-compiled
+        return _predict_probit_proba(A_test,self.beta_hat)
+
+
+    def reasoning(self,A_test):
+        '''Method Function:
+
+            Define a classification inference method based on positive-class Probit probabilities
+
+        :parameters:
+            - A_test (jnp.ndarray) - (m,p) Test design matrix with training column order
+
+        :return:
+            - y_pred (jnp.ndarray) - (m,) Binary predictions with dtype int32
+        '''
+
+        ### Thresholding changes only the decision rule, not the trained probability model
+        probabilities = self.predict_proba(A_test)
+        y_pred = (probabilities[:,1] >= self.threshold).astype(jnp.int32)
+
+        return y_pred
+
+
+    def _info(self):
+        '''Method Function:
+
+            Define an internal method to obtain basic meta information
+
+        :parameters:
+            nothing
+
+        :return:
+            - info (str) - Text introduction of the component
+        '''
+
+        return "QRProbitComponent: binary Probit regression component based on Fisher scoring and column-pivoted Householder QR decomposition, implemented with the JAX technology stack"
 
 
 

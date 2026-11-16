@@ -57,7 +57,8 @@ python build.py --clean --install
 ```python
 import jax
 import jax.numpy as jnp
-from statjax.regression import HouseholderOLSComponent, SVDRidgeComponent, CDLassoComponent, QRLogisticComponent
+from jax.scipy.stats import norm
+from statjax.regression import HouseholderOLSComponent, SVDRidgeComponent, CDLassoComponent, QRLogisticComponent, QRProbitComponent
 
 # 准备训练数据（列满秩设计矩阵A与观测标签b）
 A_train = jax.random.normal(jax.random.PRNGKey(0), (100, 5))
@@ -88,6 +89,17 @@ logistic = QRLogisticComponent(l2=1e-6)
 beta_hat, metrics = logistic.train(A=A_train, b=binary_labels)
 probabilities = logistic.predict_proba(A_test=A_train)
 class_pred = logistic.reasoning(A_test=A_train)
+
+# 训练二分类Probit回归，截距列由调用方提供
+A_probit = jnp.concatenate([jnp.ones((A_train.shape[0], 1)), A_train], axis=1)
+probit_true = jnp.array([0.35, 1.2, -2.1, 0.7, 3.3, -1.5])
+probit_labels = jax.random.bernoulli(
+    jax.random.PRNGKey(2), norm.cdf(A_probit @ probit_true)
+).astype(jnp.float64)
+probit = QRProbitComponent()
+probit_beta, metrics = probit.train(A=A_probit, b=probit_labels)
+probabilities = probit.predict_proba(A_test=A_probit)
+class_pred = probit.reasoning(A_test=A_probit)
 ```
 
 可运行的端到端演示：
@@ -97,6 +109,7 @@ python example/example_001.py   # OLS（Householder QR）
 python example/example_002.py   # 岭回归（SVD）
 python example/example_003.py   # LASSO（坐标下降）
 python example/example_004.py   # 二分类Logistic回归（IRLS + 列主元QR）
+python example/example_005.py   # 二分类Probit回归（Fisher scoring + 列主元QR）
 ```
 
 运行单元测试：
@@ -106,11 +119,11 @@ pip install pytest
 python -m pytest -v
 ```
 
-从零开始的完整自我测试流程见 [StatJAX自我测试完整流程_SH_V004.md](design/StatJAX自我测试完整流程_SH_V004.md)。
+从零开始的完整自我测试流程见 [StatJAX自我测试完整流程_SH_V005.md](design/StatJAX自我测试完整流程_SH_V005.md)。
 
 ### 3.3 设计
 <details>
-<summary>点击查看设计文档（共12份）</summary>
+<summary>点击查看设计文档（共15份）</summary>
 
 | 文件 | 说明 |
 |:----|:----|
@@ -118,14 +131,17 @@ python -m pytest -v
 | [StatJAX001_实施方案_SH_V001.md](design/StatJAX001_实施方案_SH_V001.md) | StatJAX001迭代的实施方案 |
 | [StatJAX001_OLS_SH_V003.md](design/StatJAX001_OLS_SH_V003.md) | OLS算法文档：基于Householder QR分解求解普通最小二乘 |
 | [StatJAX002_实施方案_SH_V001.md](design/StatJAX002_实施方案_SH_V001.md) | StatJAX002迭代的实施方案 |
-| [StatJAX002_岭回归_SH_V002.md](design/StatJAX002_岭回归_SH_V002.md) | 岭回归算法文档：基于SVD分解求解岭回归 |
+| [StatJAX002_岭回归_SH_V002.md](design/StatJAX002_岭回归_SH_V002.md) | Ridge回归算法文档：基于SVD分解的岭回归 |
 | [StatJAX003_实施方案_SH_V001.md](design/StatJAX003_实施方案_SH_V001.md) | StatJAX003迭代的实施方案 |
 | [StatJAX003_LASSO_SH_V001.md](design/StatJAX003_LASSO_SH_V001.md) | LASSO算法文档：基于坐标下降法求解L1正则回归 |
 | [StatJAX004_实施方案_SH_V001.md](design/StatJAX004_实施方案_SH_V001.md) | StatJAX004迭代的实施方案 |
 | [StatJAX004_logistic_SH_V001.md](design/StatJAX004_logistic_SH_V001.md) | Logistic算法文档：IRLS、列主元Householder QR与Armijo回溯 |
+| [StatJAX005_实施方案_SH_V001.md](design/StatJAX005_实施方案_SH_V001.md) | StatJAX005迭代的实施方案 |
+| [StatJAX005_Probit_SH_V001.md](design/StatJAX005_Probit_SH_V001.md) | Probit算法文档：Fisher scoring、列主元Householder QR与Armijo步长减半 |
 | [StatJAX自我测试完整流程_SH_V002.md](design/StatJAX自我测试完整流程_SH_V002.md) | StatJAX从零开始的完整自我测试流程（适用于statjax 0.2.1） |
 | [StatJAX自我测试完整流程_SH_V003.md](design/StatJAX自我测试完整流程_SH_V003.md) | StatJAX从零开始的完整自我测试流程（适用于statjax 0.3.1） |
 | [StatJAX自我测试完整流程_SH_V004.md](design/StatJAX自我测试完整流程_SH_V004.md) | StatJAX从零开始的完整自我测试流程（适用于statjax 0.4.1） |
+| [StatJAX自我测试完整流程_SH_V005.md](design/StatJAX自我测试完整流程_SH_V005.md) | StatJAX从零开始的完整自我测试流程（适用于statjax 0.5.1） |
 </details>
 
 ## 4.算法
@@ -137,10 +153,17 @@ python -m pytest -v
 | regression | SVDRidgeComponent | 基于SVD分解求解岭回归：min ‖X·w − y‖₂² + λ·‖w‖₂²，化为逐奇异分量压缩 ŵ = V·diag(σᵢ/(σᵢ²+λ))·Uᵀ·y | 原生承载L2正则；多重共线性与秩亏下数值稳定；基于JAX全程可微、可JIT编译、可GPU加速 |
 | regression | CDLassoComponent | 基于坐标下降法求解LASSO：min ½‖y − X·β‖₂² + λ·‖β‖₁，逐坐标精确最小化（软阈值算子 β_j = soft(z_j, λ)/s_j + 秩-1残差更新） | L1精确稀疏解，直接实现特征选择；无需矩阵分解，高维友好；KKT最优性校验（JAX原生）；基于JAX全程可微、可JIT编译、可GPU加速 |
 | regression | QRLogisticComponent | 平均交叉熵加特征权重L2正则的二分类Logistic回归，通过IRLS与列主元Householder QR求解，并结合数值秩截断和Armijo回溯 | logaddexp稳定损失；截距不正则化；仅使用训练集标准化；输出双列概率与0/1类别；损失、梯度和推理使用选择性JIT，动态秩QR由主机控制 |
+| regression | QRProbitComponent | 无正则二分类Probit最大似然估计，通过Fisher scoring/IRLS与列主元Householder QR求解，并结合数值秩报错和Armijo步长减半 | 正态log-CDF稳定似然；截距与预处理由调用方准备；输出双列正态CDF概率与0/1类别；矩阵内核选择性JIT，秩诊断由主机控制 |
 
 ## 5.ChangeLog
 <details>
 <summary>点击查看ChangeLog</summary>
+
+### Version-0.5.1
+  - 新增回归组件QRProbitComponent（基于Fisher scoring与列主元Householder QR的二分类Probit回归）
+  - 新增单元测试文件statjax/tests/test_probit.py，包含15个数值、推理与输入校验测试
+  - 深化全项目注释，整合整体设计与Probit算法文档（StatJAX005）内容
+  - 自我测试流程文档更新为《StatJAX自我测试完整流程_SH_V005.md》
 
 ### Version-0.4.1
   - 新增回归组件QRLogisticComponent（基于IRLS与列主元Householder QR的二分类Logistic回归）
@@ -162,7 +185,7 @@ python -m pytest -v
 ### Version-0.2.0
   - 新增回归组件HouseholderOLSComponent（基于Householder QR分解的OLS线性回归）
   - 新增单元测试文件statjax/tests/test_ols.py
-  - 完成全项目注释，整合设计文档与OLS算法文档内容
+  - 完成全项目注释，整合设计文档与OLS算法文档
 
 ### Version-0.1.1
   - 算法包框架开发

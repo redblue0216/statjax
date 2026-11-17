@@ -12,7 +12,7 @@
 Module Introduction
 -------------------
 
-This is a collection of concrete regression and binary-classification implementation classes. Each algorithm is mounted as an independent Component under BaseRegression, preserving the overall Base / Component / Algo architecture
+This is a collection of concrete regression, binary-classification and multiclass-classification implementation classes. Each algorithm is mounted as an independent Component under BaseRegression, preserving the overall Base / Component / Algo architecture
 
 - Design mode:
 
@@ -22,18 +22,22 @@ This is a collection of concrete regression and binary-classification implementa
 
     (1) JAX technology stack (thin QR decomposition, triangular back substitution, thin SVD decomposition, singular value shrinkage, soft thresholding operator, Gauss-Seidel coordinate sweep, rank-1 residual update, IRLS, Fisher scoring, column-pivoted QR, Armijo backtracking, normal log-CDF, JIT compilation where shapes permit)
 
+    (2) Reference-category Softmax, row-major parameter unfolding, per-sample Cholesky whitening, Kronecker-product design matrices and jointly coupled multinomial Newton systems
+
 - Main functions:
 
     (1) Linear regression, regularized regression and sparse regression
 
     (2) Binary Logistic and Probit probability inference and classification
 
+    (3) Multinomial Logistic K-class probability inference and argmax classification
+
 Usage examples
 --------------
 .. code-block:: python
     :linenos:
 
-    from statjax.regression import HouseholderOLSComponent,SVDRidgeComponent,CDLassoComponent,QRLogisticComponent,QRProbitComponent
+    from statjax.regression import HouseholderOLSComponent,SVDRidgeComponent,CDLassoComponent,QRLogisticComponent,QRProbitComponent,QRMultinomialLogisticComponent
 
     ### Train the OLS model and solve the optimal regression coefficients
     ols_instance = HouseholderOLSComponent()
@@ -66,6 +70,13 @@ Usage examples
     probabilities = probit_instance.predict_proba(A_test=A_probit_test)
     y_pred = probit_instance.reasoning(A_test=A_probit_test)
 
+    ### Train multinomial Logistic regression with explicit K and integer labels 0,...,K-1
+    multinomial_instance = QRMultinomialLogisticComponent(n_classes=3,l2=1e-4)
+    theta_hat,metrics = multinomial_instance.train(A=A_multiclass_train,b=b_multiclass_train)
+    ### Return K-class probabilities in label order and argmax class predictions
+    probabilities = multinomial_instance.predict_proba(A_test=A_multiclass_test)
+    y_pred = multinomial_instance.reasoning(A_test=A_multiclass_test)
+
 Class Description
 -----------------
 (1)TestRegression: This is a regression test placeholder component implementation class, the main function is to verify the framework link, the main technical inheritance
@@ -79,6 +90,8 @@ Class Description
 (5)QRLogisticComponent: This is a binary Logistic regression component based on IRLS and column-pivoted Householder QR decomposition, the main functions are stable L2-regularized training, numerical-rank truncation, Armijo-protected updates, two-class probability inference and threshold-based classification
 
 (6)QRProbitComponent: This is a binary Probit regression component based on Fisher scoring and column-pivoted Householder QR decomposition, the main functions are stable unregularized maximum-likelihood training, explicit numerical-rank failure, Armijo-protected updates, normal-CDF probability inference and threshold-based classification
+
+(7)QRMultinomialLogisticComponent: This is a multinomial Logistic regression component based on reference-category Softmax, jointly coupled IRLS, per-sample Cholesky whitening and handwritten column-pivoted Householder QR, the main functions are L2-regularized training, numerical-rank truncation, Armijo-protected updates, K-class probability inference and argmax classification
 
 References
 ----------
@@ -98,6 +111,8 @@ References
 
 - [Logistic regression](https://en.wikipedia.org/wiki/Logistic_regression)
 
+- [Multinomial logistic regression](https://en.wikipedia.org/wiki/Multinomial_logistic_regression)
+
 - [Probit model](https://en.wikipedia.org/wiki/Probit_model)
 
 - [Iteratively reweighted least squares](https://en.wikipedia.org/wiki/Iteratively_reweighted_least_squares)
@@ -113,6 +128,8 @@ References
 - StatJAX004 Logistic Design Document `"StatJAX004 Logistic SH V001"<https://github.com/redblue0216/statjax>`_
 
 - StatJAX005 Probit Design Document `"StatJAX005 Probit SH V001"<https://github.com/redblue0216/statjax>`_
+
+- StatJAX006 Multinomial Logistic Design Document `"StatJAX006 Multinomial Logistic SH V001"<https://github.com/redblue0216/statjax>`_
 '''
 
 
@@ -130,6 +147,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax import lax
 from jax.scipy.linalg import qr,solve_triangular
+from jax.scipy.special import logsumexp
 from jax.scipy.stats import norm
 from jax.numpy.linalg import lstsq
 ### Project Package - Algorithm Components
@@ -160,6 +178,9 @@ jax.config.update("jax_enable_x64",True)
 ###
 ### class:QRProbitComponent
 ### ------This is a binary Probit regression component based on Fisher scoring and column-pivoted Householder QR decomposition, with explicit numerical-rank failure, Armijo step halving, normal-CDF probability inference and threshold-based classification
+###
+### class:QRMultinomialLogisticComponent
+### ------This is a multinomial Logistic regression component based on reference-category Softmax, jointly coupled IRLS, per-sample Cholesky whitening and handwritten column-pivoted Householder QR, with numerical-rank truncation, Armijo backtracking, K-class probability inference and argmax classification
 ###
 ################################################################################################################################################################################
 
@@ -2486,6 +2507,888 @@ class QRProbitComponent(BaseRegression):
         '''
 
         return "QRProbitComponent: binary Probit regression component based on Fisher scoring and column-pivoted Householder QR decomposition, implemented with the JAX technology stack"
+
+
+
+##############################################################################################################################################################################
+##############################################################################################################################################################################
+
+
+def _multinomial_design_matrix(X,mean,scale):
+    '''Method Function:
+
+        Define a multinomial design-matrix function that reuses training-set standardization and appends the intercept column
+
+    :parameters:
+        - X (jnp.ndarray) - (n,p) Feature matrix
+        - mean (jnp.ndarray) - (p,) Training-set feature means
+        - scale (jnp.ndarray) - (p,) Training-set feature scales
+
+    :return:
+        - Phi (jnp.ndarray) - (n,p+1) Standardized design matrix with the intercept in the last column
+    '''
+
+    X_scaled = (X - mean) / scale
+    ones = jnp.ones((X.shape[0],1),dtype=X.dtype)
+    Phi = jnp.concatenate([X_scaled,ones],axis=1)
+
+    return Phi
+
+
+
+def _multinomial_full_logits(Phi,theta,n_classes):
+    '''Method Function:
+
+        Define reference-category Softmax logits using row-major parameter unfolding
+
+    :parameters:
+        - Phi (jnp.ndarray) - (n,d) Standardized intercept-augmented design matrix
+        - theta (jnp.ndarray) - (d*(K-1),) Row-major unfolded free-category parameters
+        - n_classes (int) - Total number of classes K
+
+    :return:
+        - logits (jnp.ndarray) - (n,K) Free-category logits followed by the zero reference-category logit
+    '''
+
+    n,d = Phi.shape
+    q = n_classes - 1
+    B = theta.reshape((d,q))
+    reference = jnp.zeros((n,1),dtype=Phi.dtype)
+    logits = jnp.concatenate([Phi @ B,reference],axis=1)
+
+    return logits
+
+
+
+def _multinomial_penalty_mask(n_design_columns,n_classes,dtype):
+    '''Method Function:
+
+        Define the L2 penalty mask, excluding every free-category intercept parameter
+
+    :parameters:
+        - n_design_columns (int) - Number of columns in the augmented design matrix
+        - n_classes (int) - Total number of classes K
+        - dtype (jnp.dtype) - Parameter array dtype
+
+    :return:
+        - penalty (jnp.ndarray) - Flattened feature/intercept penalty mask
+    '''
+
+    q = n_classes - 1
+    penalty_by_row = jnp.concatenate(
+        [jnp.ones(n_design_columns - 1,dtype=dtype),jnp.zeros(1,dtype=dtype)]
+    )
+    penalty = jnp.repeat(penalty_by_row,q)
+
+    return penalty
+
+
+
+def _multinomial_objective(theta,Phi,Y,penalty,l2,n_classes):
+    '''Method Function:
+
+        Define the stable unaveraged multinomial negative log-likelihood plus L2 regularization
+
+    :parameters:
+        - theta (jnp.ndarray) - Flattened free-category parameters
+        - Phi (jnp.ndarray) - Intercept-augmented design matrix
+        - Y (jnp.ndarray) - One-hot encoded class labels
+        - penalty (jnp.ndarray) - Feature/intercept penalty mask
+        - l2 (float) - Non-negative L2 regularization coefficient
+        - n_classes (int) - Total number of classes K
+
+    :return:
+        - objective (jnp.ndarray) - Scalar regularized negative log-likelihood
+    '''
+
+    logits = _multinomial_full_logits(Phi,theta,n_classes)
+    nll = jnp.sum(logsumexp(logits,axis=1) - jnp.sum(Y * logits,axis=1))
+    objective = nll + 0.5 * l2 * jnp.sum(penalty * theta * theta)
+
+    return objective
+
+
+
+def _multinomial_matrix_gradient(theta,Phi,Y,penalty,l2,n_classes):
+    '''Method Function:
+
+        Define the analytic matrix gradient of the regularized multinomial objective
+
+    :parameters:
+        - theta (jnp.ndarray) - Flattened free-category parameters
+        - Phi (jnp.ndarray) - Intercept-augmented design matrix
+        - Y (jnp.ndarray) - One-hot encoded class labels
+        - penalty (jnp.ndarray) - Feature/intercept penalty mask
+        - l2 (float) - Non-negative L2 regularization coefficient
+        - n_classes (int) - Total number of classes K
+
+    :return:
+        - gradient (jnp.ndarray) - Row-major flattened analytic gradient
+    '''
+
+    logits = _multinomial_full_logits(Phi,theta,n_classes)
+    probabilities = jax.nn.softmax(logits,axis=1)
+    residual = probabilities[:,:-1] - Y[:,:-1]
+    data_gradient = (Phi.T @ residual).reshape(-1)
+    gradient = data_gradient + l2 * penalty * theta
+
+    return gradient
+
+
+
+def _build_multinomial_irls_system(theta,Phi,Y,penalty,n_classes,l2,probability_floor,weight_jitter):
+    '''Method Function:
+
+        Define the per-sample whitened and regularization-augmented multinomial IRLS least-squares system
+
+    :parameters:
+        - theta (jnp.ndarray) - Current row-major flattened parameters
+        - Phi (jnp.ndarray) - Intercept-augmented design matrix
+        - Y (jnp.ndarray) - One-hot encoded class labels
+        - penalty (jnp.ndarray) - Feature/intercept penalty mask
+        - n_classes (int) - Total number of classes K
+        - l2 (float) - Non-negative L2 regularization coefficient
+        - probability_floor (float) - Probability floor used only for IRLS weights
+        - weight_jitter (float) - Positive diagonal damping for Cholesky stability
+
+    :return:
+        - A_augmented (jnp.ndarray) - Whitened weighted design with L2 augmentation
+        - c_augmented (jnp.ndarray) - Whitened working response with zero regularization response
+    '''
+
+    n,d = Phi.shape
+    q = n_classes - 1
+    dq = d * q
+    B = theta.reshape((d,q))
+    eta = Phi @ B
+    logits = jnp.concatenate([eta,jnp.zeros((n,1),dtype=Phi.dtype)],axis=1)
+    probabilities = jax.nn.softmax(logits,axis=1)
+
+    ### Protect only the IRLS weights; the statistical objective uses the original logits
+    probabilities = jnp.clip(probabilities,probability_floor,1.0)
+    probabilities = probabilities / jnp.sum(probabilities,axis=1,keepdims=True)
+    p = probabilities[:,:-1]
+    error = Y[:,:-1] - p
+
+    eye_q = jnp.eye(q,dtype=Phi.dtype)
+    S = -p[:,:,None] * p[:,None,:]
+    S = S + eye_q[None,:,:] * p[:,:,None]
+    S = S + weight_jitter * eye_q[None,:,:]
+    L = jnp.linalg.cholesky(S)
+
+    def per_sample(L_i,x_i,eta_i,error_i):
+        ### Row-major theta requires phi_i.T kron I_q
+        base_design = jnp.kron(x_i[None,:],eye_q)
+        A_i = L_i.T @ base_design
+        c_i = L_i.T @ eta_i + solve_triangular(
+            L_i,error_i,lower=True,check_finite=False
+        )
+        return A_i,c_i
+
+    A_blocks,c = jax.vmap(per_sample)(L,Phi,eta,error)
+    A = A_blocks.reshape((n * q,dq))
+    c = c.reshape((n * q,))
+
+    ### Unaveraged NLL uses sqrt(l2), not the mean-loss sqrt(n*l2) convention
+    regularizer = jnp.sqrt(l2) * jnp.diag(penalty)
+    A_augmented = jnp.concatenate([A,regularizer],axis=0)
+    c_augmented = jnp.concatenate([c,jnp.zeros(dq,dtype=Phi.dtype)])
+
+    return A_augmented,c_augmented
+
+
+
+def _multinomial_column_pivoted_householder_qr(A):
+    '''Method Function:
+
+        Define economic column-pivoted Householder QR with static column loops and dynamic JAX pivots
+
+    :parameters:
+        - A (jnp.ndarray) - (m,n) Least-squares matrix with m>=n
+
+    :return:
+        - Q (jnp.ndarray) - (m,n) Economic column-orthogonal factor
+        - R (jnp.ndarray) - (n,n) Upper triangular factor
+        - permutation (jnp.ndarray) - Column order satisfying A[:,permutation]=Q@R
+    '''
+
+    m,n = A.shape
+    if m < n:
+        raise ValueError("The Householder QR implementation requires m >= n")
+
+    dtype = A.dtype
+    permutation = jnp.arange(n)
+    work = A
+    householder_vectors = jnp.zeros((m,n),dtype=dtype)
+    betas = jnp.zeros(n,dtype=dtype)
+    tiny = jnp.finfo(dtype).tiny
+
+    for k in range(n):
+        trailing = work[k:,k:]
+        squared_norms = jnp.sum(trailing * trailing,axis=0)
+        pivot = k + jnp.argmax(squared_norms)
+
+        column_k = work[:,k]
+        column_p = work[:,pivot]
+        work = work.at[:,k].set(column_p)
+        work = work.at[:,pivot].set(column_k)
+
+        perm_k = permutation[k]
+        perm_p = permutation[pivot]
+        permutation = permutation.at[k].set(perm_p)
+        permutation = permutation.at[pivot].set(perm_k)
+
+        x = work[k:,k]
+        norm_x = jnp.linalg.norm(x)
+        alpha = jnp.where(x[0] >= 0.0,-norm_x,norm_x)
+        v = x.at[0].add(-alpha)
+        v_squared = jnp.sum(v * v)
+        safe_v_squared = jnp.where(v_squared > tiny,v_squared,1.0)
+        beta = jnp.where(v_squared > tiny,2.0 / safe_v_squared,0.0)
+
+        block = work[k:,k:]
+        block = block - beta * v[:,None] * (v @ block)[None,:]
+        work = work.at[k:,k:].set(block)
+        householder_vectors = householder_vectors.at[k:,k].set(v)
+        betas = betas.at[k].set(beta)
+
+        exact_column = jnp.zeros_like(x).at[0].set(alpha)
+        work = work.at[k:,k].set(exact_column)
+
+    ### Apply saved reflectors in reverse order to construct economic Q
+    Q = jnp.eye(m,n,dtype=dtype)
+    for k in range(n - 1,-1,-1):
+        v = householder_vectors[k:,k]
+        q_block = Q[k:,:]
+        q_block = q_block - betas[k] * v[:,None] * (v @ q_block)[None,:]
+        Q = Q.at[k:,:].set(q_block)
+
+    R = jnp.triu(work[:n,:])
+
+    return Q,R,permutation
+
+
+
+def _multinomial_cpqr_solve(A,b,rank_tol=1e-12):
+    '''Method Function:
+
+        Define rank-truncated column-pivoted QR least squares without explicit matrix inversion
+
+    :parameters:
+        - A (jnp.ndarray) - (m,n) Weighted augmented least-squares matrix
+        - b (jnp.ndarray) - (m,) Least-squares response
+        - rank_tol (float) - Relative threshold applied to the diagonal of R
+
+    :return:
+        - solution (jnp.ndarray) - Basic least-squares solution in original column order
+        - numerical_rank (jnp.ndarray) - Estimated numerical rank
+    '''
+
+    Q,R,permutation = _multinomial_column_pivoted_householder_qr(A)
+    n = A.shape[1]
+    diagonal = jnp.abs(jnp.diag(R))
+    diagonal_scale = jnp.maximum(diagonal[0],jnp.finfo(A.dtype).tiny)
+    tolerance = rank_tol * diagonal_scale
+    numerical_rank = jnp.sum(diagonal > tolerance)
+    projected_b = Q.T @ b
+    u = jnp.zeros(n,dtype=A.dtype)
+
+    for i in range(n - 1,-1,-1):
+        remainder = R[i,i + 1:] @ u[i + 1:]
+        active = jnp.logical_and(i < numerical_rank,diagonal[i] > tolerance)
+        safe_denominator = jnp.where(active,R[i,i],1.0)
+        candidate = (projected_b[i] - remainder) / safe_denominator
+        u = u.at[i].set(jnp.where(active,candidate,0.0))
+
+    solution = jnp.zeros(n,dtype=A.dtype).at[permutation].set(u)
+
+    return solution,numerical_rank
+
+
+
+def _fit_qr_multinomial_logistic(A,b,n_classes,l2,max_iter,tolerance,rank_tol,probability_floor,weight_jitter,armijo_c1,max_backtracks,check_gradient):
+    '''Method Function:
+
+        Define multinomial training through IRLS, handwritten pivoted Householder QR and Armijo backtracking
+
+    :parameters:
+        - A (jnp.ndarray) - Validated training feature matrix
+        - b (jnp.ndarray) - Validated integer class labels
+        - n_classes (int) - Total number of classes K
+        - l2 (float) - Non-negative L2 regularization coefficient
+        - max_iter (int) - Maximum number of IRLS iterations
+        - tolerance (float) - Relative loss-improvement convergence tolerance
+        - rank_tol (float) - Relative numerical-rank threshold
+        - probability_floor (float) - Probability floor for IRLS weights
+        - weight_jitter (float) - Positive IRLS weight damping
+        - armijo_c1 (float) - Armijo sufficient-decrease coefficient
+        - max_backtracks (int) - Maximum number of step-halving attempts
+        - check_gradient (bool) - Whether to check the initial analytic gradient with jax.grad
+
+    :return:
+        - result (dict) - Parameters, preprocessing statistics and optimization diagnostics
+    '''
+
+    mean = jnp.mean(A,axis=0)
+    scale = jnp.std(A,axis=0)
+    scale = jnp.where(scale > 1e-12,scale,1.0)
+    Phi = _multinomial_design_matrix(A,mean,scale)
+    Y = jax.nn.one_hot(b,n_classes,dtype=jnp.float64)
+    n,d = Phi.shape
+    del n
+    q = n_classes - 1
+    dq = d * q
+    penalty = _multinomial_penalty_mask(d,n_classes,Phi.dtype)
+    theta = jnp.zeros(dq,dtype=jnp.float64)
+
+    objective = jax.jit(
+        lambda value: _multinomial_objective(value,Phi,Y,penalty,l2,n_classes)
+    )
+    gradient = jax.jit(
+        lambda value: _multinomial_matrix_gradient(value,Phi,Y,penalty,l2,n_classes)
+    )
+
+    def irls_candidate(value):
+        A_system,c_system = _build_multinomial_irls_system(
+            value,Phi,Y,penalty,n_classes,l2,probability_floor,weight_jitter
+        )
+        candidate,rank = _multinomial_cpqr_solve(A_system,c_system,rank_tol=rank_tol)
+        return candidate,rank
+
+    irls_candidate = jax.jit(irls_candidate)
+
+    gradient_error = None
+    if check_gradient:
+        automatic = jax.grad(
+            lambda value: _multinomial_objective(value,Phi,Y,penalty,l2,n_classes)
+        )(theta)
+        gradient_error = float(jnp.max(jnp.abs(automatic - gradient(theta))))
+        if gradient_error > 1e-8:
+            raise RuntimeError(f"Analytic multinomial gradient check failed: {gradient_error:.3e}")
+
+    current_loss = float(objective(theta))
+    loss_history = [current_loss]
+    rank_history = []
+    step_history = []
+    converged = False
+    stop_reason = "max_iter"
+    n_iter = 0
+
+    for _ in range(max_iter):
+        candidate,rank = irls_candidate(theta)
+        current_gradient = gradient(theta)
+        direction = candidate - theta
+        directional_derivative = float(jnp.dot(current_gradient,direction))
+
+        ### Rank truncation or extreme weights can occasionally destroy descent
+        if not np.isfinite(directional_derivative) or directional_derivative >= 0.0:
+            direction = -current_gradient
+            directional_derivative = -float(jnp.dot(current_gradient,current_gradient))
+
+        accepted = False
+        step = 1.0
+        trial_theta = theta
+        trial_loss = current_loss
+        for _ in range(max_backtracks + 1):
+            proposed = theta + step * direction
+            proposed_loss = float(objective(proposed))
+            armijo_bound = current_loss + armijo_c1 * step * directional_derivative
+            if np.isfinite(proposed_loss) and proposed_loss <= armijo_bound:
+                trial_theta,trial_loss = proposed,proposed_loss
+                accepted = True
+                break
+            step *= 0.5
+
+        if not accepted:
+            stop_reason = "line_search_failed"
+            break
+
+        improvement = current_loss - trial_loss
+        theta = trial_theta
+        current_loss = trial_loss
+        n_iter += 1
+        loss_history.append(current_loss)
+        rank_history.append(int(rank))
+        step_history.append(float(step))
+
+        if improvement <= tolerance * max(1.0,abs(current_loss)):
+            converged = True
+            stop_reason = "converged"
+            break
+
+    return {
+        "theta_hat": theta,
+        "mean": mean,
+        "scale": scale,
+        "loss_history": loss_history,
+        "rank_history": rank_history,
+        "step_history": step_history,
+        "gradient_check_error": gradient_error,
+        "converged": converged,
+        "stop_reason": stop_reason,
+        "n_iter": n_iter
+    }
+
+
+
+@jax.jit(static_argnums=(4,))
+def _predict_multinomial_logistic_proba(A_test,theta_hat,mean,scale,n_classes):
+    '''Method Function:
+
+        Define JIT-compiled K-class probability inference using training-set preprocessing
+
+    :parameters:
+        - A_test (jnp.ndarray) - (m,p) Test feature matrix
+        - theta_hat (jnp.ndarray) - Trained row-major flattened parameters
+        - mean (jnp.ndarray) - Training-set feature means
+        - scale (jnp.ndarray) - Training-set feature scales
+        - n_classes (int) - Static total number of classes K
+
+    :return:
+        - probabilities (jnp.ndarray) - (m,K) Class probabilities in label order
+    '''
+
+    Phi = _multinomial_design_matrix(A_test,mean,scale)
+    logits = _multinomial_full_logits(Phi,theta_hat,n_classes)
+    probabilities = jax.nn.softmax(logits,axis=1)
+
+    return probabilities
+
+
+
+class QRMultinomialLogisticComponent(BaseRegression):
+    '''Class Introduction:
+
+        This is a multinomial Logistic regression component based on reference-category Softmax, jointly coupled iteratively reweighted least squares (IRLS), per-sample Cholesky whitening, handwritten column-pivoted Householder QR and Armijo backtracking. It standardizes features using training-set statistics only, appends an unpenalized intercept and returns K-class probabilities and argmax class predictions. It is intended for small and medium dense data, teaching, algorithm verification and numerically transparent reference workflows
+
+    Mathematical principle
+    ----------------------
+    (1) Multinomial Logistic model: given n samples, p input features and K classes, the inputs are $X in R^(n*p)$ and integer labels $y_i in {0,...,K-1}$ (X ∈ R^(n×p), yᵢ ∈ {0,…,K−1}). Features are standardized using training-set statistics only, then a constant column is appended:
+
+        $Phi=[X_scaled,1] in R^(n*d) , d=p+1$
+        Φ = [X_scaled, 1] ∈ R^(n×d), d = p+1, where the last design-matrix row of parameters contains the class intercepts
+
+        The last class K-1 is the reference category. Only the first $q=K-1$ (q = K−1) categories have free parameters:
+
+        $B in R^(d*q) , theta=vec_row(B) , eta_i=B^T*phi_i$
+        B ∈ R^(d×q), θ = vec_row(B), ηᵢ = Bᵀφᵢ, where vec_row means row-major unfolding
+
+        $Z=[Phi*B,0] in R^(n*K) , P_ik=exp(Z_ik)/sum_j(exp(Z_ij))$
+        Z = [ΦB, 0] ∈ R^(n×K), Pᵢₖ = exp(Zᵢₖ)/Σⱼexp(Zᵢⱼ)
+
+        Fixing the reference logit to zero selects one identifiable representative of the Softmax equivalence class. Adding the same constant to every class logit leaves all probabilities unchanged, so unconstrained estimation of K complete parameter vectors would contain a common-shift null space
+
+    (2) Stable unaveraged regularized objective: the component minimizes the total, not sample-averaged, negative log-likelihood plus L2 regularization on feature parameters only:
+
+        $J(theta)=sum_i[logsumexp(Z_i)-Z_i,y_i]+(l2/2)*sum_r(penalty_r*theta_r^2)$
+        J(θ) = Σᵢ[logsumexp(Zᵢ)−Zᵢ,ᵧᵢ] + (λ/2)Σᵣ(penaltyᵣθᵣ²), λ = l2 ≥ 0
+
+        The penalty mask equals one for standardized feature parameters and zero for every free-category intercept. logsumexp evaluates cross-entropy without explicitly forming log(Softmax), avoiding overflow and log(0) from saturated probabilities. Because the data loss is unaveraged, the IRLS augmentation uses sqrt(l2); it must not use the sqrt(n*l2) convention of QRLogisticComponent, whose data loss is averaged
+
+    (3) Analytic gradient and coupled per-sample Hessian: let $Y$ (Y) be the one-hot label matrix and $p_i=P_i,1:q$ (pᵢ = Pᵢ,₁:q). The matrix gradient and its row-major vector form are:
+
+        $G_B=Phi^T*(P_1:q-Y_1:q)$
+        G_B = Φᵀ(P₁:q−Y₁:q)
+
+        $g=vec_row(G_B)+l2*penalty*theta$
+        g = vec_row(G_B) + λ(penalty ⊙ θ)
+
+        For one observation, the Hessian with respect to its free-category logits is the categorical covariance matrix:
+
+        $S_i=diag(p_i)-p_i*p_i^T$
+        Sᵢ = diag(pᵢ)−pᵢpᵢᵀ
+
+        Sᵢ is positive semidefinite and is positive definite when every class probability is strictly positive. Its off-diagonal entries encode coupling between classes. Replacing Sᵢ by diagonal weights or fitting independent binary IRLS models would therefore solve a different problem
+
+        With row-major parameters, the per-sample design is $C_i=phi_i^T kron I_q$ (Cᵢ = φᵢᵀ ⊗ I_q), and the data Hessian is:
+
+        $H_data=sum_i(C_i^T*S_i*C_i)$
+        H_data = ΣᵢCᵢᵀSᵢCᵢ
+
+        If column-major unfolding were used, the Kronecker order would have to change to $I_q kron phi_i^T$ (I_q ⊗ φᵢᵀ). The implementation keeps logits, gradients, IRLS design and QR solution restoration in the same row-major convention
+
+    (4) Per-sample Cholesky whitening and IRLS: numerical protection first clips and renormalizes probabilities only for weight construction, then adds $weight_jitter*I$ (weight_jitter·I) to Sᵢ. The protected weight matrix is factorized as:
+
+        $S_i=L_i*L_i^T$
+        Sᵢ = LᵢLᵢᵀ
+
+        $A_i=L_i^T*(phi_i^T kron I_q)$
+        Aᵢ = Lᵢᵀ(φᵢᵀ ⊗ I_q)
+
+        The multinomial working response is $z_i=eta_i+S_i^(-1)*(y_i-p_i)$ (zᵢ = ηᵢ+Sᵢ⁻¹(yᵢ−pᵢ)), but neither zᵢ nor an explicit inverse is formed. Its whitened response is evaluated as:
+
+        $c_i=L_i^T*eta_i+L_i^(-1)*(y_i-p_i)$
+        cᵢ = Lᵢᵀηᵢ+Lᵢ⁻¹(yᵢ−pᵢ)
+
+        The second term uses a lower-triangular solve. Stacking all samples gives A with n*q rows and d*q columns and c with n*q entries. The parameter dimension is $n_theta=d*q$ (n_θ = d·q). L2 is appended directly to the least-squares system:
+
+        $A_tilde=[A;sqrt(l2)*diag(penalty)] , c_tilde=[c;0]$
+        Ã = [A; √λ·diag(penalty)], c̃ = [c; 0]
+
+        Without numerical damping, these matrices satisfy:
+
+        $A^T*A=H_data , A^T*c=H_data*theta_old-g_data$
+        AᵀA = H_data, Aᵀc = H_dataθ_old−g_data
+
+        $(H_data+l2*D^T*D)*theta_new=H_data*theta_old-g_data$
+        (H_data+λDᵀD)θ_new = H_dataθ_old−g_data
+
+        Equivalently, $(H_data+l2*D^T*D)*(theta_new-theta_old)=-(g_data+l2*D^T*D*theta_old)$ ((H_data+λDᵀD)(θ_new−θ_old)=−(g_data+λDᵀDθ_old)). IRLS is therefore the least-squares expression of the regularized Newton step; QR solves that step without explicitly constructing H_data, normal equations or an inverse. Probability clipping and jitter make affected iterations damped approximate Newton steps, not changes to the statistical likelihood
+
+    (5) Handwritten column-pivoted Householder QR: each Householder reflection is $H=I-beta*v*v^T$ with $beta=2/(v^T*v)$ (H = I−βvvᵀ, β = 2/(vᵀv)). Column pivoting computes:
+
+        $A_tilde*Pi=Q*R , A_tilde[:,permutation]=Q*R$
+        ÃΠ = QR, equivalently Ã[:, permutation] = QR
+
+        The implementation chooses the largest remaining column norm at each static column step, applies reflections only to the trailing block, saves the vectors and constructs economic Q by applying the saved reflectors in reverse order. Orthogonal transformations avoid the condition-number squaring $kappa(A^T*A)=kappa(A)^2$ (κ(AᵀA)=κ(A)²) caused by explicitly forming normal equations
+
+        Numerical rank is estimated by $|R_ii|>rank_tol*|R_00|$ (|Rᵢᵢ| > rank_tol·|R₀₀|). Back substitution retains reliable pivoted directions and sets free variables to zero. Restoring with .at[permutation].set(...) returns the original parameter order. A rank-deficient result is a basic solution determined by pivoted columns, not necessarily the SVD minimum-norm solution
+
+    (6) Descent protection and Armijo backtracking: QR returns a candidate point, so the actual direction is $Delta_theta=theta_candidate-theta_old$ (Δθ = θ_candidate−θ_old). A valid descent direction satisfies $g^T*Delta_theta<0$ (gᵀΔθ < 0). If this value is non-finite or non-negative, the component falls back to $-g$ (−g). Starting at alpha=1 and halving the step, an accepted point must satisfy:
+
+        $J(theta+alpha*Delta_theta)<=J(theta)+c1*alpha*g^T*Delta_theta$
+        J(θ+αΔθ) ≤ J(θ)+c₁αgᵀΔθ, c₁ = armijo_c1
+
+        Non-finite candidates are rejected. If no step is acceptable, training retains the last valid parameters and reports stop_reason='line_search_failed'. Reaching max_iter without meeting the convergence test reports converged=False and stop_reason='max_iter', rather than presenting an iteration limit as statistical convergence
+
+    (7) Why reference-category IRLS plus whitening and pivoted QR: the method is selected for numerical transparency and independent verification, not universal speed:
+
+        ============================  ============================================  ==========================================
+        Method                        Main property                                 Typical scenario
+        ============================  ============================================  ==========================================
+        Full-K Softmax + SGD/Adam     Simple mini-batches; shift non-identifiability  Large, sparse or online training
+        Reference Softmax + L-BFGS    No explicit Hessian; general-purpose          Medium and larger dense problems
+        Explicit Hessian + Cholesky   Direct Newton solve; Hessian storage           Small positive-definite systems
+        Independent binary IRLS       Ignores cross-class curvature coupling         Not equivalent to joint Softmax IRLS
+        IRLS + whitening + QR         Joint curvature, rank diagnostics, no inverse  Dense reference and collinear data
+        ============================  ============================================  ==========================================
+
+        For n samples, d design columns and q free categories, probability and gradient work is about O(n*d*q), batched Cholesky is about O(n*q^3), the whitened design storage is about O(n*d*q^2), and dense QR has a leading cost about O(n*d^2*q^3) when n is large relative to d*q. These costs make the component unsuitable for arbitrarily large n*d*K workloads
+
+    Algorithm flow
+    --------------
+    .. code-block:: text
+
+        Input A(n×p), b(n,), explicit K and optimization controls
+            |
+            v
+        Validate finite features and integer labels 0,...,K-1
+            |
+            v
+        Training-only mean / scale -> standardize -> append intercept
+            |
+            v
+        Initialize theta = 0 -> all initial class probabilities = 1/K
+            |
+            +------------> Optionally compare analytic gradient with jax.grad once
+            |
+            v
+        Reference-category logits -> stable logsumexp unaveraged NLL + L2
+            |
+            v
+        Softmax -> protected p -> S_i = diag(p_i)-p_i*p_i.T+jitter*I
+            |
+            v
+        Batched Cholesky -> A_i = L_i.T@(phi_i.T kron I_q)
+                         -> c_i = L_i.T@eta_i + triangular_solve(L_i,y_i-p_i)
+            |
+            v
+        Stack sample blocks -> append sqrt(l2) penalty rows and zero responses
+            |
+            v
+        Handwritten column-pivoted economic Householder QR
+            |
+            v
+        Numerical-rank truncation -> masked back substitution -> restore pivots
+            |
+            v
+        Candidate direction -> check g.T@delta < 0 -> fallback to -g if needed
+            |
+            v
+        Armijo backtracking -> accept only finite sufficient-decrease updates
+            |
+            +------------> Record loss, accepted step, rank and stop reason
+            |
+            v
+        Inference: reuse mean / scale -> append intercept -> Softmax
+            |
+            +------------> predict_proba: K columns; reasoning: row-wise argmax
+
+    Step 1 (input and model structure): require a non-empty finite A(n,p), finite integer labels b(n,) and explicit n_classes=K>=2. Labels are checked before conversion to int32 so fractional values cannot be silently truncated. Explicit K preserves classes that happen to be absent from a small training sample
+
+    Step 2 (training-only preprocessing): compute $mu_j=(1/n)*sum_iX_ij$ and $s_j=std(X_:,j)$ (μⱼ = (1/n)ΣᵢXᵢⱼ, sⱼ = std(X:,j)). Replace near-zero scales by 1, standardize and append the intercept. Test data never participates in estimating these statistics
+
+    Step 3 (initialization and penalty): set theta=0, giving initial probability 1/K for every class and initial data loss n*log(K). Construct the row-major mask so all feature parameters are penalized and all free-category intercepts are excluded
+
+    Step 4 (independent gradient check): when check_gradient=True, compare the handwritten matrix gradient with jax.grad at theta=0 before iterating. A mismatch above 1e-8 raises RuntimeError. Automatic differentiation is an independent checker, not the training direction or optimizer. When disabled, gradient_check_error is None
+
+    Step 5 (stable objective): concatenate free-category logits with the zero reference logit and evaluate logsumexp(Z_i)-Z_i,y_i. Probability clipping used later for weights never replaces the original objective logits
+
+    Step 6 (joint IRLS weights): compute protected probabilities, the full q×q categorical covariance for every sample and diagonal jitter. Retaining off-diagonal terms is essential for the joint multinomial Newton system
+
+    Step 7 (batched whitening): use jnp.linalg.cholesky and jax.vmap to construct every A_i and c_i. The inverse-looking response term is computed by solve_triangular, and no per-sample Python loop is required
+
+    Step 8 (regularization augmentation): stack sample blocks and append sqrt(l2)*diag(penalty) with zero responses. This scale matches the unaveraged objective, and the zero mask rows leave intercepts unpenalized
+
+    Step 9 (QR candidate): run handwritten economic column-pivoted Householder QR, estimate rank from diag(R), perform masked back substitution and restore original column order. The rank history contains one entry per accepted update, not a fabricated initial full-rank value
+
+    Step 10 (direction and line search): form candidate-theta, check the directional derivative, fall back to the analytic negative gradient when necessary and try the full step before halving. The Armijo condition protects each accepted update
+
+    Step 11 (update and stopping): append accepted loss, rank and step values. Stop with converged=True when $J_old-J_new<=tolerance*max(1,abs(J_new))$ (J_old−J_new ≤ tolerance·max(1,|J_new|)). n_iter counts accepted updates and equals len(loss_history)-1. Line-search failure and max_iter have distinct non-converged stop states
+
+    Step 12 (probability and class inference): reuse mean and scale, append the intercept and compute reference-category Softmax. predict_proba returns columns in label order 0,...,K-1 with the reference category last; reasoning returns int32 argmax labels. The reference category is a normal class, not an 'other' or rejection category
+
+    JAX unique advantages
+    ---------------------
+    (1) Explicit float64 and matrix computation: repeated Cholesky, Householder reflections, small diagonal values and rank decisions benefit from float64. The module enables jax_enable_x64 before component arrays are created, and public training converts features and labels to consistent dtypes
+
+    (2) Selective JIT compilation: fixed-shape objective, analytic gradient, IRLS candidate construction, handwritten QR and probability inference are compiled through JAX. n_classes is static for inference. The Python training loop deliberately retains host-side direction, Armijo and convergence decisions; it is not an end-to-end device-resident while loop
+
+    (3) vmap for per-sample matrix algebra: the mathematical derivation is written for one L_i, phi_i, eta_i and residual, then lifted to all samples with jax.vmap. This avoids hand-written three-dimensional indexing and Python sample loops while preserving full class coupling
+
+    (4) Automatic differentiation as an independent checker: training uses the analytic matrix gradient and QR candidate rather than gradient descent. jax.grad checks the same scalar objective at initialization, helping detect row/column unfolding, class-slice and penalty-mask inconsistencies:
+
+    .. code-block:: python
+
+        import jax
+        from statjax.regression._components import _multinomial_objective,_multinomial_matrix_gradient
+
+        manual = _multinomial_matrix_gradient(theta,Phi,Y,penalty,l2,n_classes)
+        automatic = jax.grad(_multinomial_objective)(theta,Phi,Y,penalty,l2,n_classes)
+        relative_error = jax.numpy.linalg.norm(manual-automatic) / (1.0+jax.numpy.linalg.norm(automatic))
+
+    (5) Immutable functional updates: column exchanges, reflector storage, Q construction, masked back substitution and pivot restoration use .at[...].set(...). These operations preserve JAX array semantics and make data dependencies visible inside compiled functions
+
+    (6) Reproducible independent tests: explicit PRNGKey streams generate features, true parameters, categorical labels and data splits. Tests compare against automatic differentiation, an explicitly assembled small Newton system, QR identities and probability constraints rather than relying only on classification accuracy
+
+    (7) Backend migration with explicit boundaries: matrix operations can run on supported JAX backends, but Cholesky, handwritten QR, compilation and determinism must be assessed per backend. CPU is the reference environment. float(...) and int(...) conversions synchronize with the host; throughput benchmarks must use block_until_ready()
+
+    Precautions
+    -----------
+    (1) Dense scale limitation: each iteration materializes whitened sample blocks and QR work arrays. Large n, p or K can rapidly increase compilation time, memory and compute. L-BFGS, mini-batch methods or Hessian-vector iterative solvers may be more appropriate for large sparse workloads
+
+    (2) Do not split into independent binary models: S_i contains non-diagonal covariance terms. Independent one-vs-rest binary IRLS changes both the objective and probability normalization and is not the joint multinomial Newton method implemented here
+
+    (3) Keep an identifiable parameterization: unconstrained full-K Softmax has a common-shift null space. This component uses a reference category; a sum-to-zero or other constraint would require consistent changes to logits, gradients and IRLS matrices
+
+    (4) Preserve regularization scaling: the unaveraged NLL requires sqrt(l2) augmented rows. Switching to mean NLL requires corresponding changes to the objective, gradient and IRLS system rather than changing only one expression
+
+    (5) Preserve row-major ordering: theta.reshape((d,q)) and phi_i.T kron I_q are paired conventions. Changing one without the other invalidates the Newton system even if probability predictions still appear plausible
+
+    (6) Complete separation is distinct from collinearity: QR rank handling and positive L2 can address numerical rank issues, but an unregularized completely separated model may have no finite maximum-likelihood estimate. Finite arrays alone do not prove that a finite statistical optimum exists
+
+    (7) rank_tol is a numerical choice: too small a value can retain noise directions, while too large a value discards informative directions. Rank-truncated QR returns a basic solution and is not principal-component regression, SVD truncation or a minimum-norm solver
+
+    (8) Probability floor and jitter are numerical protection: probability_floor and weight_jitter affect only IRLS weights. Large values can distort curvature and should prompt review of scaling, separation, regularization and step control rather than being treated as modeling preferences
+
+    (9) Reuse training preprocessing: validation, testing and deployment must use the stored mean and scale in the original order standardize -> append intercept -> matrix multiply -> reference Softmax. Do not standardize all data before splitting
+
+    (10) Use float64 for the reference workflow: rank thresholds, Cholesky and numerical checks are calibrated for float64. User-created auxiliary arrays should also use consistent dtypes
+
+    (11) Static shapes affect compilation: the handwritten Householder column loop is statically unrolled. Changes in sample, feature or class dimensions can trigger recompilation, and large parameter dimensions can increase compile time
+
+    (12) Host synchronization is intentional: Python loss, direction and step checks are clear reference-implementation boundaries, not a maximum-throughput design. GPU use does not automatically imply faster training
+
+    (13) Interpret convergence states precisely: a small accepted loss improvement declares convergence under the configured criterion. max_iter and line_search_failed return converged=False and preserve the last valid parameters; inspect loss, rank and step histories before accepting a model
+
+    (14) Accuracy is not a sufficient correctness test: retain gradient, explicit Newton-system, QR reconstruction, orthogonality, rank, monotone-loss and probability-row checks. Accuracy also depends on data generation and task difficulty
+
+    (15) Production model management is outside scope: string-label mapping, serialization, outlier handling, hyperparameter selection, calibration and genuine cross-validation require additional engineering. The integer class order and reference category must remain stable across training and deployment
+
+    :example:
+        >>> import jax
+        >>> import jax.numpy as jnp
+        >>> from statjax.regression import QRMultinomialLogisticComponent
+        >>> # Generate one reproducible population before splitting train and test data
+        >>> keys = jax.random.split(jax.random.PRNGKey(42),5)
+        >>> A = jax.random.normal(keys[0],(400,4),dtype=jnp.float64)
+        >>> true_w = 2.0 * jax.random.normal(keys[1],(4,3),dtype=jnp.float64) / 2.0
+        >>> true_b = 0.35 * jax.random.normal(keys[2],(3,),dtype=jnp.float64)
+        >>> b = jax.random.categorical(keys[3],A @ true_w + true_b,axis=1).astype(jnp.int32)
+        >>> permutation = jax.random.permutation(keys[4],400)
+        >>> test_idx,train_idx = permutation[:100],permutation[100:]
+        >>> A_train,A_test = A[train_idx],A[test_idx]
+        >>> b_train,b_test = b[train_idx],b[test_idx]
+        >>> # Train jointly coupled reference-category multinomial Logistic regression
+        >>> multinomial_instance = QRMultinomialLogisticComponent(n_classes=3,l2=1e-4)
+        >>> theta_hat,metrics = multinomial_instance.train(A=A_train,b=b_train)
+        >>> probabilities = multinomial_instance.predict_proba(A_test=A_test)
+        >>> y_pred = multinomial_instance.reasoning(A_test=A_test)
+        >>> accuracy = jnp.mean(y_pred == b_test)
+
+    :reference:
+        - [Multinomial logistic regression](https://en.wikipedia.org/wiki/Multinomial_logistic_regression)
+        - [Iteratively reweighted least squares](https://en.wikipedia.org/wiki/Iteratively_reweighted_least_squares)
+        - [Householder transformation](https://en.wikipedia.org/wiki/Householder_transformation)
+        - [QR decomposition](https://en.wikipedia.org/wiki/QR_decomposition)
+        - [Backtracking line search](https://en.wikipedia.org/wiki/Backtracking_line_search)
+        - StatJAX006 Multinomial Logistic Design Document `"StatJAX006 Multinomial Logistic SH V001"<https://github.com/redblue0216/statjax>`_
+    '''
+
+
+    def __init__(self,n_classes,l2=1e-4,max_iter=50,tolerance=1e-9,rank_tol=1e-12,probability_floor=1e-12,weight_jitter=1e-10,armijo_c1=1e-4,max_backtracks=30,check_gradient=True):
+        '''Attribute Function:
+
+            Define initialization for multinomial model structure, optimization controls and trained state
+
+        :parameters:
+            - n_classes (int) - Total number of classes K, at least 2
+            - l2 (float) - Non-negative L2 regularization coefficient; intercepts are not penalized
+            - max_iter (int) - Maximum number of IRLS iterations
+            - tolerance (float) - Positive relative loss-improvement tolerance
+            - rank_tol (float) - Positive relative numerical-rank threshold
+            - probability_floor (float) - IRLS probability floor in (0,1)
+            - weight_jitter (float) - Positive diagonal damping for IRLS weights
+            - armijo_c1 (float) - Armijo coefficient in (0,1)
+            - max_backtracks (int) - Maximum number of Armijo backtracking attempts
+            - check_gradient (bool) - Whether to independently check the initial analytic gradient
+        '''
+
+        if not isinstance(n_classes,int) or isinstance(n_classes,bool) or n_classes < 2:
+            raise ValueError("n_classes must be an integer greater than or equal to 2")
+        if not 0.0 <= l2 < float("inf"):
+            raise ValueError("l2 must be finite and non-negative")
+        if not isinstance(max_iter,int) or isinstance(max_iter,bool) or max_iter < 1:
+            raise ValueError("max_iter must be a positive integer")
+        if not 0.0 < tolerance < float("inf"):
+            raise ValueError("tolerance must be finite and positive")
+        if not 0.0 < rank_tol < float("inf"):
+            raise ValueError("rank_tol must be finite and positive")
+        if not 0.0 < probability_floor < 1.0:
+            raise ValueError("probability_floor must be in (0,1)")
+        if not 0.0 < weight_jitter < float("inf"):
+            raise ValueError("weight_jitter must be finite and positive")
+        if not 0.0 < armijo_c1 < 1.0:
+            raise ValueError("armijo_c1 must be in (0,1)")
+        if not isinstance(max_backtracks,int) or isinstance(max_backtracks,bool) or max_backtracks < 1:
+            raise ValueError("max_backtracks must be a positive integer")
+        if not isinstance(check_gradient,bool):
+            raise ValueError("check_gradient must be a boolean")
+
+        self.n_classes = n_classes
+        self.l2 = l2
+        self.max_iter = max_iter
+        self.tolerance = tolerance
+        self.rank_tol = rank_tol
+        self.probability_floor = probability_floor
+        self.weight_jitter = weight_jitter
+        self.armijo_c1 = armijo_c1
+        self.max_backtracks = max_backtracks
+        self.check_gradient = check_gradient
+        self.theta_hat = None
+        self.mean = None
+        self.scale = None
+        self.metrics = None
+
+
+    def train(self,A,b):
+        '''Method Function:
+
+            Define multinomial training with automatic training-only standardization and intercept augmentation
+
+        :parameters:
+            - A (jnp.ndarray) - (n,p) Training feature matrix without a manually appended intercept
+            - b (jnp.ndarray) - (n,) Integer class labels in 0,...,K-1
+
+        :return:
+            - theta_hat (jnp.ndarray) - ((p+1)*(K-1),) Row-major flattened trained parameters
+            - metrics (dict) - Loss, rank, step, gradient-check and convergence diagnostics
+        '''
+
+        A = jnp.asarray(A,dtype=jnp.float64)
+        b_values = jnp.asarray(b,dtype=jnp.float64)
+        if A.ndim != 2 or b_values.ndim != 1 or A.shape[0] != b_values.shape[0]:
+            raise ValueError("A must have shape (n,p), b must have shape (n,), and their sample counts must match")
+        if A.shape[0] == 0 or A.shape[1] == 0:
+            raise ValueError("A and b must be non-empty and A must contain at least one feature")
+        if not bool(jnp.all(jnp.isfinite(A))) or not bool(jnp.all(jnp.isfinite(b_values))):
+            raise ValueError("A and b must contain only finite values")
+        if not bool(jnp.all(b_values == jnp.trunc(b_values))):
+            raise ValueError("b must contain integer class labels")
+        if not bool(jnp.all((b_values >= 0) & (b_values < self.n_classes))):
+            raise ValueError("b must contain class labels in the range 0,...,n_classes-1")
+        b = b_values.astype(jnp.int32)
+
+        result = _fit_qr_multinomial_logistic(
+            A,b,self.n_classes,self.l2,self.max_iter,self.tolerance,self.rank_tol,
+            self.probability_floor,self.weight_jitter,self.armijo_c1,
+            self.max_backtracks,self.check_gradient
+        )
+        self.theta_hat = result["theta_hat"]
+        self.mean = result["mean"]
+        self.scale = result["scale"]
+        self.metrics = {
+            "initial_loss": result["loss_history"][0],
+            "final_loss": result["loss_history"][-1],
+            "loss_history": result["loss_history"],
+            "rank_history": result["rank_history"],
+            "step_history": result["step_history"],
+            "gradient_check_error": result["gradient_check_error"],
+            "converged": result["converged"],
+            "stop_reason": result["stop_reason"],
+            "n_iter": result["n_iter"],
+            "l2": self.l2
+        }
+
+        return self.theta_hat,self.metrics
+
+
+    def predict_proba(self,A_test):
+        '''Method Function:
+
+            Define K-class probability inference using the trained parameters and training preprocessing
+
+        :parameters:
+            - A_test (jnp.ndarray) - (m,p) Test feature matrix with the training feature dimension
+
+        :return:
+            - probabilities (jnp.ndarray) - (m,K) Probabilities in class-label order
+        '''
+
+        if self.theta_hat is None:
+            raise RuntimeError("QRMultinomialLogisticComponent has not been trained yet, please call the train method first")
+        A_test = jnp.asarray(A_test,dtype=jnp.float64)
+        if A_test.ndim != 2 or A_test.shape[1] != self.mean.shape[0]:
+            raise ValueError("A_test must have shape (m,p) with the same feature dimension as training data")
+        if not bool(jnp.all(jnp.isfinite(A_test))):
+            raise ValueError("A_test must contain only finite values")
+
+        return _predict_multinomial_logistic_proba(
+            A_test,self.theta_hat,self.mean,self.scale,self.n_classes
+        )
+
+
+    def reasoning(self,A_test):
+        '''Method Function:
+
+            Define multiclass inference by row-wise argmax over class probabilities
+
+        :parameters:
+            - A_test (jnp.ndarray) - (m,p) Test feature matrix
+
+        :return:
+            - y_pred (jnp.ndarray) - (m,) Predicted int32 class labels
+        '''
+
+        probabilities = self.predict_proba(A_test)
+        y_pred = jnp.argmax(probabilities,axis=1).astype(jnp.int32)
+
+        return y_pred
+
+
+    def _info(self):
+        '''Method Function:
+
+            Define an internal method to obtain basic meta information
+
+        :parameters:
+            nothing
+
+        :return:
+            - info (str) - Text introduction of the component
+        '''
+
+        return "QRMultinomialLogisticComponent: multinomial Logistic regression component based on reference-category Softmax, IRLS, per-sample whitening and column-pivoted Householder QR decomposition, implemented with the JAX technology stack"
 
 
 

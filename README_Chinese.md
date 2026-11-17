@@ -58,7 +58,7 @@ python build.py --clean --install
 import jax
 import jax.numpy as jnp
 from jax.scipy.stats import norm
-from statjax.regression import HouseholderOLSComponent, SVDRidgeComponent, CDLassoComponent, QRLogisticComponent, QRProbitComponent
+from statjax.regression import HouseholderOLSComponent, SVDRidgeComponent, CDLassoComponent, QRLogisticComponent, QRProbitComponent, QRMultinomialLogisticComponent
 
 # 准备训练数据（列满秩设计矩阵A与观测标签b）
 A_train = jax.random.normal(jax.random.PRNGKey(0), (100, 5))
@@ -100,6 +100,16 @@ probit = QRProbitComponent()
 probit_beta, metrics = probit.train(A=A_probit, b=probit_labels)
 probabilities = probit.predict_proba(A_test=A_probit)
 class_pred = probit.reasoning(A_test=A_probit)
+
+# 训练多分类Logistic回归，显式指定K，标签为0,...,K-1的整数
+multi_true = jax.random.normal(jax.random.PRNGKey(3), (5, 3))
+multi_labels = jax.random.categorical(
+    jax.random.PRNGKey(4), A_train @ multi_true, axis=1
+).astype(jnp.int32)
+multinomial = QRMultinomialLogisticComponent(n_classes=3, l2=1e-4)
+theta_hat, metrics = multinomial.train(A=A_train, b=multi_labels)
+probabilities = multinomial.predict_proba(A_test=A_train)  # (n, 3)，参考类别在最后一列
+class_pred = multinomial.reasoning(A_test=A_train)         # int32类型的argmax类别
 ```
 
 可运行的端到端演示：
@@ -110,6 +120,7 @@ python example/example_002.py   # 岭回归（SVD）
 python example/example_003.py   # LASSO（坐标下降）
 python example/example_004.py   # 二分类Logistic回归（IRLS + 列主元QR）
 python example/example_005.py   # 二分类Probit回归（Fisher scoring + 列主元QR）
+python example/example_006.py   # 多分类Logistic回归（白化IRLS + 手写列主元QR）
 ```
 
 运行单元测试：
@@ -119,11 +130,11 @@ pip install pytest
 python -m pytest -v
 ```
 
-从零开始的完整自我测试流程见 [StatJAX自我测试完整流程_SH_V005.md](design/StatJAX自我测试完整流程_SH_V005.md)。
+从零开始的完整自我测试流程见 [StatJAX自我测试完整流程_SH_V006.md](design/StatJAX自我测试完整流程_SH_V006.md)。
 
 ### 3.3 设计
 <details>
-<summary>点击查看设计文档（共15份）</summary>
+<summary>点击查看设计文档（共18份）</summary>
 
 | 文件 | 说明 |
 |:----|:----|
@@ -138,10 +149,13 @@ python -m pytest -v
 | [StatJAX004_logistic_SH_V001.md](design/StatJAX004_logistic_SH_V001.md) | Logistic算法文档：IRLS、列主元Householder QR与Armijo回溯 |
 | [StatJAX005_实施方案_SH_V001.md](design/StatJAX005_实施方案_SH_V001.md) | StatJAX005迭代的实施方案 |
 | [StatJAX005_Probit_SH_V001.md](design/StatJAX005_Probit_SH_V001.md) | Probit算法文档：Fisher scoring、列主元Householder QR与Armijo步长减半 |
+| [StatJAX006_实施方案_SH_V001.md](design/StatJAX006_实施方案_SH_V001.md) | StatJAX006迭代的实施方案 |
+| [StatJAX006_多分类logistic_SH_V001.md](design/StatJAX006_多分类logistic_SH_V001.md) | 多分类Logistic算法文档：参考类别Softmax、白化IRLS、手写列主元QR与Armijo回溯 |
 | [StatJAX自我测试完整流程_SH_V002.md](design/StatJAX自我测试完整流程_SH_V002.md) | StatJAX从零开始的完整自我测试流程（适用于statjax 0.2.1） |
 | [StatJAX自我测试完整流程_SH_V003.md](design/StatJAX自我测试完整流程_SH_V003.md) | StatJAX从零开始的完整自我测试流程（适用于statjax 0.3.1） |
 | [StatJAX自我测试完整流程_SH_V004.md](design/StatJAX自我测试完整流程_SH_V004.md) | StatJAX从零开始的完整自我测试流程（适用于statjax 0.4.1） |
 | [StatJAX自我测试完整流程_SH_V005.md](design/StatJAX自我测试完整流程_SH_V005.md) | StatJAX从零开始的完整自我测试流程（适用于statjax 0.5.1） |
+| [StatJAX自我测试完整流程_SH_V006.md](design/StatJAX自我测试完整流程_SH_V006.md) | StatJAX从零开始的完整自我测试流程（适用于statjax 0.6.1） |
 </details>
 
 ## 4.算法
@@ -154,10 +168,17 @@ python -m pytest -v
 | regression | CDLassoComponent | 基于坐标下降法求解LASSO：min ½‖y − X·β‖₂² + λ·‖β‖₁，逐坐标精确最小化（软阈值算子 β_j = soft(z_j, λ)/s_j + 秩-1残差更新） | L1精确稀疏解，直接实现特征选择；无需矩阵分解，高维友好；KKT最优性校验（JAX原生）；基于JAX全程可微、可JIT编译、可GPU加速 |
 | regression | QRLogisticComponent | 平均交叉熵加特征权重L2正则的二分类Logistic回归，通过IRLS与列主元Householder QR求解，并结合数值秩截断和Armijo回溯 | logaddexp稳定损失；截距不正则化；仅使用训练集标准化；输出双列概率与0/1类别；损失、梯度和推理使用选择性JIT，动态秩QR由主机控制 |
 | regression | QRProbitComponent | 无正则二分类Probit最大似然估计，通过Fisher scoring/IRLS与列主元Householder QR求解，并结合数值秩报错和Armijo步长减半 | 正态log-CDF稳定似然；截距与预处理由调用方准备；输出双列正态CDF概率与0/1类别；矩阵内核选择性JIT，秩诊断由主机控制 |
+| regression | QRMultinomialLogisticComponent | 参考类别Softmax与未平均L2正则交叉熵的多分类Logistic回归，通过联合IRLS、逐样本Cholesky白化和手写列主元Householder QR求解，并结合Armijo回溯 | 显式K与训练集标准化；截距不正则化；输出K列概率与int32 argmax类别；矩阵内核选择性JIT，线搜索由主机控制；面向中小规模稠密数据 |
 
 ## 5.ChangeLog
 <details>
 <summary>点击查看ChangeLog</summary>
+
+### Version-0.6.1
+  - 新增回归组件QRMultinomialLogisticComponent（参考类别Softmax、联合IRLS、逐样本白化与手写列主元Householder QR）
+  - 新增单元测试文件statjax/tests/test_multinomial_logistic.py，包含17个数值、推理与输入校验测试
+  - 深化全项目注释，整合整体设计与多分类Logistic算法文档（StatJAX006）内容
+  - 自我测试流程文档更新为《StatJAX自我测试完整流程_SH_V006.md》
 
 ### Version-0.5.1
   - 新增回归组件QRProbitComponent（基于Fisher scoring与列主元Householder QR的二分类Probit回归）
@@ -183,7 +204,7 @@ python -m pytest -v
   - 深化全项目注释，整合岭回归算法文档（StatJAX002）内容
 
 ### Version-0.2.0
-  - 新增回归组件HouseholderOLSComponent（基于Householder QR分解的OLS线性回归）
+  - 新增回归组件HouseholderOLSComponent（基于Householder QR分解的OLS回归）
   - 新增单元测试文件statjax/tests/test_ols.py
   - 完成全项目注释，整合设计文档与OLS算法文档
 

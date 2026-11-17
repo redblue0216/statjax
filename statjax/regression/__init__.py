@@ -22,18 +22,18 @@ This is the public class interface of the regression module. It exposes independ
 
     (1) __all__ explicit export
 
-    (2) Unified train / reasoning / _info component interfaces, with algorithm-specific extensions such as Logistic and Probit predict_proba
+    (2) Unified train / reasoning / _info component interfaces, with algorithm-specific extensions such as binary and multinomial predict_proba
 
 - Main functions:
 
-    (1) Open OLS, ridge, LASSO, binary Logistic and binary Probit components
+    (1) Open OLS, ridge, LASSO, binary Logistic, binary Probit and multinomial Logistic components
 
 Usage examples
 --------------
 .. code-block:: python
     :linenos:
 
-    from statjax.regression import HouseholderOLSComponent,SVDRidgeComponent,CDLassoComponent,QRLogisticComponent,QRProbitComponent
+    from statjax.regression import HouseholderOLSComponent,SVDRidgeComponent,CDLassoComponent,QRLogisticComponent,QRProbitComponent,QRMultinomialLogisticComponent
 
     ols_instance = HouseholderOLSComponent()
     x_hat,metrics = ols_instance.train(A=A_train,b=b_train)
@@ -59,6 +59,13 @@ Usage examples
     probabilities = probit_instance.predict_proba(A_test=A_probit_test)
     y_pred = probit_instance.reasoning(A_test=A_probit_test)
 
+    ### Multinomial Logistic uses explicit K and integer labels 0,...,K-1
+    multinomial_instance = QRMultinomialLogisticComponent(n_classes=3,l2=1e-4)
+    theta_hat,metrics = multinomial_instance.train(A=A_multiclass_train,b=b_multiclass_train)
+    ### Probabilities have K columns in label order; reasoning applies row-wise argmax
+    probabilities = multinomial_instance.predict_proba(A_test=A_multiclass_test)
+    y_pred = multinomial_instance.reasoning(A_test=A_multiclass_test)
+
 Class Description
 -----------------
 (1)TestRegression: This is a regression test placeholder component implementation class, the main function is to verify the framework link, the main technical inheritance
@@ -73,6 +80,8 @@ Class Description
 
 (6)QRProbitComponent: This is a binary Probit regression component based on Fisher scoring and column-pivoted Householder QR decomposition, with explicit numerical-rank failure, Armijo step halving, probability inference and threshold-based classification
 
+(7)QRMultinomialLogisticComponent: This is a multinomial Logistic regression component based on reference-category Softmax, jointly coupled IRLS, per-sample Cholesky whitening and handwritten column-pivoted Householder QR, with numerical-rank truncation, Armijo backtracking, K-class probability inference and argmax classification
+
 References
 ----------
 StatJAX Design Document `"StatJAX Design SH V001"<https://github.com/redblue0216/statjax>`_
@@ -80,6 +89,8 @@ StatJAX Design Document `"StatJAX Design SH V001"<https://github.com/redblue0216
 StatJAX004 Logistic Design Document `"StatJAX004 Logistic SH V001"<https://github.com/redblue0216/statjax>`_
 
 StatJAX005 Probit Design Document `"StatJAX005 Probit SH V001"<https://github.com/redblue0216/statjax>`_
+
+StatJAX006 Multinomial Logistic Design Document `"StatJAX006 Multinomial Logistic SH V001"<https://github.com/redblue0216/statjax>`_
 
 '''
 
@@ -93,7 +104,7 @@ StatJAX005 Probit Design Document `"StatJAX005 Probit SH V001"<https://github.co
 ### Basic package
 ### Algorithm package
 ### Project Package - Algorithm Components
-from statjax.regression._components import TestRegression,HouseholderOLSComponent,SVDRidgeComponent,CDLassoComponent,QRLogisticComponent,QRProbitComponent
+from statjax.regression._components import TestRegression,HouseholderOLSComponent,SVDRidgeComponent,CDLassoComponent,QRLogisticComponent,QRProbitComponent,QRMultinomialLogisticComponent
 
 
 
@@ -106,6 +117,7 @@ from statjax.regression._components import TestRegression,HouseholderOLSComponen
 ### ------CDLassoComponent
 ### ------QRLogisticComponent
 ### ------QRProbitComponent
+### ------QRMultinomialLogisticComponent
 ###
 ################################################################################################################################################################################
 
@@ -122,7 +134,8 @@ __all__ = [
     "SVDRidgeComponent",
     "CDLassoComponent",
     "QRLogisticComponent",
-    "QRProbitComponent"
+    "QRProbitComponent",
+    "QRMultinomialLogisticComponent"
 ]
 
 

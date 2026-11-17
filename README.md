@@ -58,7 +58,7 @@ python build.py --clean --install
 import jax
 import jax.numpy as jnp
 from jax.scipy.stats import norm
-from statjax.regression import HouseholderOLSComponent, SVDRidgeComponent, CDLassoComponent, QRLogisticComponent, QRProbitComponent
+from statjax.regression import HouseholderOLSComponent, SVDRidgeComponent, CDLassoComponent, QRLogisticComponent, QRProbitComponent, QRMultinomialLogisticComponent
 
 # Prepare the training data (column full rank design matrix A and observation labels b)
 A_train = jax.random.normal(jax.random.PRNGKey(0), (100, 5))
@@ -100,6 +100,16 @@ probit = QRProbitComponent()
 probit_beta, metrics = probit.train(A=A_probit, b=probit_labels)
 probabilities = probit.predict_proba(A_test=A_probit)
 class_pred = probit.reasoning(A_test=A_probit)
+
+# Train multinomial Logistic regression with explicit K and integer labels 0,...,K-1
+multi_true = jax.random.normal(jax.random.PRNGKey(3), (5, 3))
+multi_labels = jax.random.categorical(
+    jax.random.PRNGKey(4), A_train @ multi_true, axis=1
+).astype(jnp.int32)
+multinomial = QRMultinomialLogisticComponent(n_classes=3, l2=1e-4)
+theta_hat, metrics = multinomial.train(A=A_train, b=multi_labels)
+probabilities = multinomial.predict_proba(A_test=A_train)  # (n, 3), reference class last
+class_pred = multinomial.reasoning(A_test=A_train)         # int32 argmax labels
 ```
 
 Runnable end-to-end demos:
@@ -110,6 +120,7 @@ python example/example_002.py   # Ridge regression (SVD)
 python example/example_003.py   # LASSO (coordinate descent)
 python example/example_004.py   # Binary Logistic regression (IRLS + pivoted QR)
 python example/example_005.py   # Binary Probit regression (Fisher scoring + pivoted QR)
+python example/example_006.py   # Multinomial Logistic regression (whitened IRLS + handwritten pivoted QR)
 ```
 
 Run unit tests:
@@ -119,11 +130,11 @@ pip install pytest
 python -m pytest -v
 ```
 
-For the complete self-test process from scratch, see [StatJAX自我测试完整流程_SH_V005.md](design/StatJAX自我测试完整流程_SH_V005.md).
+For the complete self-test process from scratch, see [StatJAX自我测试完整流程_SH_V006.md](design/StatJAX自我测试完整流程_SH_V006.md).
 
 ### 3.3 design
 <details>
-<summary>Click to view design documents (15 files)</summary>
+<summary>Click to view design documents (18 files)</summary>
 
 | File | Description |
 |:----|:----|
@@ -138,10 +149,13 @@ For the complete self-test process from scratch, see [StatJAX自我测试完整�
 | [StatJAX004_logistic_SH_V001.md](design/StatJAX004_logistic_SH_V001.md) | Logistic algorithm document: IRLS, column-pivoted Householder QR and Armijo backtracking |
 | [StatJAX005_实施方案_SH_V001.md](design/StatJAX005_实施方案_SH_V001.md) | Implementation plan for the StatJAX005 iteration |
 | [StatJAX005_Probit_SH_V001.md](design/StatJAX005_Probit_SH_V001.md) | Probit algorithm document: Fisher scoring, column-pivoted Householder QR and Armijo step halving |
+| [StatJAX006_实施方案_SH_V001.md](design/StatJAX006_实施方案_SH_V001.md) | Implementation plan for the StatJAX006 iteration |
+| [StatJAX006_多分类logistic_SH_V001.md](design/StatJAX006_多分类logistic_SH_V001.md) | Multinomial Logistic algorithm document: reference-category Softmax, whitened IRLS, handwritten pivoted QR and Armijo backtracking |
 | [StatJAX自我测试完整流程_SH_V002.md](design/StatJAX自我测试完整流程_SH_V002.md) | Complete self-test process of StatJAX from scratch (for statjax 0.2.1) |
 | [StatJAX自我测试完整流程_SH_V003.md](design/StatJAX自我测试完整流程_SH_V003.md) | Complete self-test process of StatJAX from scratch (for statjax 0.3.1) |
 | [StatJAX自我测试完整流程_SH_V004.md](design/StatJAX自我测试完整流程_SH_V004.md) | Complete self-test process of StatJAX from scratch (for statjax 0.4.1) |
 | [StatJAX自我测试完整流程_SH_V005.md](design/StatJAX自我测试完整流程_SH_V005.md) | Complete self-test process of StatJAX from scratch (for statjax 0.5.1) |
+| [StatJAX自我测试完整流程_SH_V006.md](design/StatJAX自我测试完整流程_SH_V006.md) | Complete self-test process of StatJAX from scratch (for statjax 0.6.1) |
 </details>
 
 ## 4.algorithm
@@ -154,10 +168,17 @@ For the complete self-test process from scratch, see [StatJAX自我测试完整�
 | regression | CDLassoComponent | LASSO solved by coordinate descent: min ½‖y − X·β‖₂² + λ·‖β‖₁, per-coordinate exact minimization with the soft thresholding operator β_j = soft(z_j, λ)/s_j and rank-1 residual update | Exactly sparse solutions with feature selection; no matrix decomposition required, high-dimensional friendly; KKT optimality verification (JAX native); fully differentiable, JIT-compilable and GPU-accelerated based on JAX |
 | regression | QRLogisticComponent | Binary Logistic regression with mean cross-entropy and L2-regularized weights, solved by IRLS and column-pivoted Householder QR with numerical-rank truncation and Armijo backtracking | Stable logaddexp loss; unpenalized intercept; training-only standardization; two-column probabilities and binary classes; selective JIT for loss, gradient and inference, while dynamic-rank QR remains host-controlled |
 | regression | QRProbitComponent | Unregularized binary Probit maximum-likelihood estimation solved by Fisher scoring/IRLS and column-pivoted Householder QR, with numerical-rank errors and Armijo step halving | Stable normal log-CDF likelihood; caller-prepared intercept and preprocessing; two-column normal-CDF probabilities and binary classes; selective JIT matrix kernels with host-controlled diagnostics |
+| regression | QRMultinomialLogisticComponent | Multinomial Logistic regression with reference-category Softmax and unaveraged L2-regularized cross-entropy, solved by jointly coupled IRLS, per-sample Cholesky whitening and handwritten column-pivoted Householder QR with Armijo backtracking | Explicit K and training-only standardization; unpenalized intercepts; K-column probabilities and int32 argmax classes; selective JIT matrix kernels with host-controlled line search; intended for small and medium dense data |
 
 ## 5.ChangeLog
 <details>
 <summary>Click to view ChangeLog</summary>
+
+### Version-0.6.1
+  - Added the regression component QRMultinomialLogisticComponent (reference-category Softmax, jointly coupled IRLS, per-sample whitening and handwritten column-pivoted Householder QR)
+  - Added the unit test file statjax/tests/test_multinomial_logistic.py with 17 numerical, inference and validation tests
+  - Deepened project-wide comments, integrating the overall design and multinomial Logistic algorithm document (StatJAX006)
+  - Updated the self-test process document to StatJAX自我测试完整流程_SH_V006.md
 
 ### Version-0.5.1
   - Added the regression component QRProbitComponent (binary Probit regression based on Fisher scoring and column-pivoted Householder QR)

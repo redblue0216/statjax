@@ -24,20 +24,22 @@ This is a collection of concrete regression, binary-classification and multiclas
 
     (2) Reference-category Softmax, row-major parameter unfolding, per-sample Cholesky whitening, Kronecker-product design matrices and jointly coupled multinomial Newton systems
 
+    (3) Scale-constrained Cholesky covariance parameters, class-specific negative-orthant contrasts, GHK truncated-normal simulation, fixed-common-random-number MSL and automatic-differentiation BFGS for correlated multinomial Probit utilities
+
 - Main functions:
 
     (1) Linear regression, regularized regression and sparse regression
 
     (2) Binary Logistic and Probit probability inference and classification
 
-    (3) Multinomial Logistic K-class probability inference and argmax classification
+    (3) Multinomial Logistic and multinomial Probit K-class probability inference and argmax classification
 
 Usage examples
 --------------
 .. code-block:: python
     :linenos:
 
-    from statjax.regression import HouseholderOLSComponent,SVDRidgeComponent,CDLassoComponent,QRLogisticComponent,QRProbitComponent,QRMultinomialLogisticComponent
+    from statjax.regression import HouseholderOLSComponent,SVDRidgeComponent,CDLassoComponent,QRLogisticComponent,QRProbitComponent,QRMultinomialLogisticComponent,GHKMultinomialProbitComponent
 
     ### Train the OLS model and solve the optimal regression coefficients
     ols_instance = HouseholderOLSComponent()
@@ -77,6 +79,13 @@ Usage examples
     probabilities = multinomial_instance.predict_proba(A_test=A_multiclass_test)
     y_pred = multinomial_instance.reasoning(A_test=A_multiclass_test)
 
+    ### Multinomial Probit uses A(n,D,p), D=J-1 and the final class as reference
+    mnp_instance = GHKMultinomialProbitComponent(num_draws=128)
+    theta_hat,metrics = mnp_instance.train(A=A_mnp_train,b=b_mnp_train)
+    ### Inference draws are independent of the fixed training draws
+    probabilities = mnp_instance.predict_proba(A_test=A_mnp_test)
+    y_pred = mnp_instance.reasoning(A_test=A_mnp_test)
+
 Class Description
 -----------------
 (1)TestRegression: This is a regression test placeholder component implementation class, the main function is to verify the framework link, the main technical inheritance
@@ -92,6 +101,8 @@ Class Description
 (6)QRProbitComponent: This is a binary Probit regression component based on Fisher scoring and column-pivoted Householder QR decomposition, the main functions are stable unregularized maximum-likelihood training, explicit numerical-rank failure, Armijo-protected updates, normal-CDF probability inference and threshold-based classification
 
 (7)QRMultinomialLogisticComponent: This is a multinomial Logistic regression component based on reference-category Softmax, jointly coupled IRLS, per-sample Cholesky whitening and handwritten column-pivoted Householder QR, the main functions are L2-regularized training, numerical-rank truncation, Armijo-protected updates, K-class probability inference and argmax classification
+
+(8)GHKMultinomialProbitComponent: This is a correlated multinomial Probit component based on scale-constrained Cholesky covariance parameters, GHK choice-probability simulation, fixed-draw MSL and BFGS, with independent inference draws, J-class probabilities and argmax classification
 
 References
 ----------
@@ -115,6 +126,10 @@ References
 
 - [Probit model](https://en.wikipedia.org/wiki/Probit_model)
 
+- [Multinomial probit](https://en.wikipedia.org/wiki/Discrete_choice#Multinomial_probit)
+
+- [BFGS algorithm](https://en.wikipedia.org/wiki/Broyden%E2%80%93Fletcher%E2%80%93Goldfarb%E2%80%93Shanno_algorithm)
+
 - [Iteratively reweighted least squares](https://en.wikipedia.org/wiki/Iteratively_reweighted_least_squares)
 
 - [Backtracking line search](https://en.wikipedia.org/wiki/Backtracking_line_search)
@@ -130,6 +145,8 @@ References
 - StatJAX005 Probit Design Document `"StatJAX005 Probit SH V001"<https://github.com/redblue0216/statjax>`_
 
 - StatJAX006 Multinomial Logistic Design Document `"StatJAX006 Multinomial Logistic SH V001"<https://github.com/redblue0216/statjax>`_
+
+- StatJAX007 Multinomial Probit Design Document `"StatJAX007 Multinomial Probit SH V001"<https://github.com/redblue0216/statjax>`_
 '''
 
 
@@ -140,6 +157,7 @@ References
 
 
 ### Basic package
+from functools import lru_cache
 from statjax.regression._base import BaseRegression 
 ### Algorithm package
 import jax
@@ -147,7 +165,8 @@ import jax.numpy as jnp
 import numpy as np
 from jax import lax
 from jax.scipy.linalg import qr,solve_triangular
-from jax.scipy.special import logsumexp
+from jax.scipy.optimize import minimize
+from jax.scipy.special import log_ndtr,logsumexp,ndtr,ndtri
 from jax.scipy.stats import norm
 from jax.numpy.linalg import lstsq
 ### Project Package - Algorithm Components
@@ -181,6 +200,9 @@ jax.config.update("jax_enable_x64",True)
 ###
 ### class:QRMultinomialLogisticComponent
 ### ------This is a multinomial Logistic regression component based on reference-category Softmax, jointly coupled IRLS, per-sample Cholesky whitening and handwritten column-pivoted Householder QR, with numerical-rank truncation, Armijo backtracking, K-class probability inference and argmax classification
+###
+### class:GHKMultinomialProbitComponent
+### ------This is a correlated multinomial Probit regression component based on scale-constrained Cholesky covariance parameters, class contrasts, GHK, fixed-draw MSL and BFGS, with independent probability inference and argmax classification
 ###
 ################################################################################################################################################################################
 
@@ -3389,6 +3411,668 @@ class QRMultinomialLogisticComponent(BaseRegression):
         '''
 
         return "QRMultinomialLogisticComponent: multinomial Logistic regression component based on reference-category Softmax, IRLS, per-sample whitening and column-pivoted Householder QR decomposition, implemented with the JAX technology stack"
+
+
+
+##############################################################################################################################################################################
+##############################################################################################################################################################################
+
+
+_MNP_DIAGONAL_RAW_CLIP = 20.0
+_MNP_CDF_FLOOR = 1e-14
+_MNP_UNIFORM_FLOOR = 1e-12
+
+
+def _num_mnp_cov_params(d):
+    '''Method Function:
+
+        Return the number of free Cholesky parameters after fixing Sigma[0,0]=1
+
+    :parameters:
+        - d (int) - Dimension of utility differences, D=J-1
+
+    :return:
+        - count (int) - Number of free covariance parameters
+    '''
+
+    return d * (d + 1) // 2 - 1
+
+
+
+def _initial_mnp_params(d,p):
+    '''Method Function:
+
+        Initialize beta=0 and L=I for independent standard normal utility differences
+
+    :parameters:
+        - d (int) - Utility-difference dimension
+        - p (int) - Number of shared utility coefficients
+
+    :return:
+        - theta (jnp.ndarray) - Initial unconstrained parameter vector
+    '''
+
+    return jnp.zeros(p + _num_mnp_cov_params(d),dtype=jnp.float64)
+
+
+
+def _unpack_mnp_params(theta,d,p):
+    '''Method Function:
+
+        Decode an unconstrained vector into beta and a scale-constrained lower Cholesky factor
+
+    :parameters:
+        - theta (jnp.ndarray) - Unconstrained optimization parameters
+        - d (int) - Utility-difference dimension
+        - p (int) - Number of shared utility coefficients
+
+    :return:
+        - beta (jnp.ndarray) - Shared utility coefficients
+        - L (jnp.ndarray) - Lower triangular factor with L[0,0]=1
+    '''
+
+    beta = theta[:p]
+    raw = theta[p:]
+    rows = []
+    k = 0
+    zero = jnp.array(0.0,dtype=theta.dtype)
+    one = jnp.array(1.0,dtype=theta.dtype)
+    for r in range(d):
+        row = []
+        for c in range(d):
+            if c > r:
+                row.append(zero)
+            elif r == 0 and c == 0:
+                row.append(one)
+            elif r == c:
+                row.append(jnp.exp(jnp.clip(raw[k],-_MNP_DIAGONAL_RAW_CLIP,_MNP_DIAGONAL_RAW_CLIP)))
+                k += 1
+            else:
+                row.append(raw[k])
+                k += 1
+        rows.append(jnp.stack(row))
+
+    return beta,jnp.stack(rows)
+
+
+
+@lru_cache(maxsize=None)
+def _mnp_choice_contrasts(n_classes):
+    '''Method Function:
+
+        Construct C[y] such that class y is optimal exactly when C[y]@eta<0; the last class is the reference
+
+    :parameters:
+        - n_classes (int) - Total number of classes J
+
+    :return:
+        - contrasts (np.ndarray) - (J,D,D) Cached class-specific contrast matrices
+    '''
+
+    d = n_classes - 1
+    matrices = []
+    for y in range(n_classes):
+        C = np.zeros((d,d),dtype=np.float64)
+        for r,k in enumerate(k for k in range(n_classes) if k != y):
+            if k < d:
+                C[r,k] = 1.0
+            if y < d:
+                C[r,y] -= 1.0
+        matrices.append(C)
+
+    return np.stack(matrices)
+
+
+
+def _ghk_mnp_log_probs(theta,A,uniforms):
+    '''Method Function:
+
+        Evaluate all class log probabilities with the GHK sequential truncated-normal simulator
+
+    :parameters:
+        - theta (jnp.ndarray) - Unconstrained utility and covariance parameters
+        - A (jnp.ndarray) - (n,D,p) Alternative-related design tensor
+        - uniforms (jnp.ndarray) - (n,R,D) Fixed or independently drawn uniform random numbers
+
+    :return:
+        - log_probabilities (jnp.ndarray) - (n,J) Simulated log probabilities in class-label order
+    '''
+
+    n,d,p = A.shape
+    if uniforms.ndim != 3 or uniforms.shape[0] != n or uniforms.shape[2] != d or uniforms.shape[1] < 1:
+        raise ValueError("uniforms must have shape (n,R,D) with R >= 1 and dimensions matching A")
+    R = uniforms.shape[1]
+    beta,L_cov = _unpack_mnp_params(theta,d,p)
+    Sigma = L_cov @ L_cov.T
+    mu = jnp.einsum("ndp,p->nd",A,beta)
+    contrasts = jnp.asarray(_mnp_choice_contrasts(d + 1),dtype=A.dtype)
+
+    all_log_probs = []
+    for y in range(d + 1):
+        C = contrasts[y]
+        nu = mu @ C.T
+        S = C @ Sigma @ C.T
+        Gamma = jnp.linalg.cholesky(S)
+        log_weight = jnp.zeros((n,R),dtype=A.dtype)
+        z_previous = []
+
+        ### Sequential GHK conditioning: z_r is drawn from (-infinity,b_r)
+        for r in range(d):
+            if r == 0:
+                past = jnp.zeros((n,R),dtype=A.dtype)
+            else:
+                past = sum(Gamma[r,s] * z_previous[s] for s in range(r))
+            b = -(nu[:,None,r] + past) / Gamma[r,r]
+            log_weight = log_weight + log_ndtr(b)
+            cdf = jnp.clip(ndtr(b),_MNP_CDF_FLOOR,1.0)
+            u = jnp.clip(uniforms[:,:,r],_MNP_UNIFORM_FLOOR,1.0 - _MNP_UNIFORM_FLOOR)
+            z_previous.append(ndtri(u * cdf))
+
+        all_log_probs.append(logsumexp(log_weight,axis=1) - jnp.log(float(R)))
+
+    return jnp.stack(all_log_probs,axis=1)
+
+
+
+def _mnp_simulated_nll(theta,A,b,uniforms):
+    '''Method Function:
+
+        Define mean negative simulated log-likelihood conditional on fixed common random numbers
+
+    :parameters:
+        - theta (jnp.ndarray) - Unconstrained model parameters
+        - A (jnp.ndarray) - Training design tensor
+        - b (jnp.ndarray) - Integer observed classes
+        - uniforms (jnp.ndarray) - Fixed training random numbers
+
+    :return:
+        - loss (jnp.ndarray) - Scalar mean negative simulated log-likelihood
+    '''
+
+    log_probabilities = _ghk_mnp_log_probs(theta,A,uniforms)
+
+    return -jnp.mean(log_probabilities[jnp.arange(b.shape[0]),b])
+
+
+
+def _fit_ghk_multinomial_probit(A,b,num_draws,max_iter,grad_tol,seed):
+    '''Method Function:
+
+        Fit multinomial Probit by fixed-draw simulated maximum likelihood and JAX BFGS with automatic differentiation
+
+    :parameters:
+        - A (jnp.ndarray) - Validated training design tensor
+        - b (jnp.ndarray) - Validated integer class labels
+        - num_draws (int) - Number of fixed GHK paths per observation
+        - max_iter (int) - Maximum BFGS iterations
+        - grad_tol (float) - BFGS gradient tolerance
+        - seed (int) - Training random seed
+
+    :return:
+        - result (dict) - Parameters, interpretable covariance state and optimization diagnostics
+    '''
+
+    n,d,p = A.shape
+    uniforms = jax.random.uniform(
+        jax.random.PRNGKey(seed),(n,num_draws,d),dtype=jnp.float64
+    )
+    theta0 = _initial_mnp_params(d,p)
+    objective = jax.jit(lambda theta: _mnp_simulated_nll(theta,A,b,uniforms))
+    initial_nll = float(objective(theta0))
+    optimization = minimize(
+        objective,theta0,method="BFGS",options={"maxiter":max_iter,"gtol":grad_tol}
+    )
+
+    theta_hat = optimization.x
+    beta_hat,l_hat = _unpack_mnp_params(theta_hat,d,p)
+    sigma_hat = l_hat @ l_hat.T
+    final_nll = float(optimization.fun)
+    grad_norm = float(jnp.linalg.norm(optimization.jac))
+    if not bool(jnp.all(jnp.isfinite(theta_hat))) or not np.isfinite(final_nll) or not np.isfinite(grad_norm):
+        raise RuntimeError("Multinomial Probit optimization produced non-finite parameters or diagnostics")
+
+    return {
+        "theta_hat": theta_hat,
+        "beta_hat": beta_hat,
+        "l_hat": l_hat,
+        "sigma_hat": sigma_hat,
+        "initial_nll": initial_nll,
+        "final_nll": final_nll,
+        "converged": bool(optimization.success),
+        "status": int(optimization.status),
+        "n_iter": int(optimization.nit),
+        "grad_norm": grad_norm
+    }
+
+
+
+@jax.jit(static_argnums=(2,3,4))
+def _predict_ghk_mnp_proba(A_test,theta_hat,num_draws,seed,normalize):
+    '''Method Function:
+
+        Simulate independent inference draws, optionally normalizing finite-draw GHK probabilities by row
+
+    :parameters:
+        - A_test (jnp.ndarray) - Test design tensor
+        - theta_hat (jnp.ndarray) - Trained unconstrained parameters
+        - num_draws (int) - Static number of inference paths
+        - seed (int) - Static independent inference seed
+        - normalize (bool) - Whether to normalize each probability row
+
+    :return:
+        - probabilities (jnp.ndarray) - (m,J) Simulated class probabilities
+    '''
+
+    n,d,_ = A_test.shape
+    uniforms = jax.random.uniform(
+        jax.random.PRNGKey(seed),(n,num_draws,d),dtype=jnp.float64
+    )
+    log_probabilities = _ghk_mnp_log_probs(theta_hat,A_test,uniforms)
+    if normalize:
+        probabilities = jnp.exp(
+            log_probabilities - logsumexp(log_probabilities,axis=1,keepdims=True)
+        )
+    else:
+        probabilities = jnp.exp(log_probabilities)
+
+    return probabilities
+
+
+
+class GHKMultinomialProbitComponent(BaseRegression):
+    '''Class Introduction:
+
+        This is a multinomial Probit component using scale-constrained Cholesky covariance parameters, GHK choice-probability simulation, fixed-draw simulated maximum likelihood and BFGS with JAX automatic differentiation. It models joint choices through correlated normal latent utilities rather than independent binary classifiers. The final class is the reference category and Sigma[0,0]=1 identifies the latent utility scale. It is intended for small and medium dense data, teaching, algorithm verification and numerically transparent reference workflows
+
+    Mathematical principle
+    ----------------------
+    (1) Latent utility and reference-category identification: for observation i and J mutually exclusive alternatives, the complete utility model is:
+
+        $U_ij=v_ij+epsilon^U_ij , y_i=argmax_j U_ij$
+        Uᵢⱼ = vᵢⱼ + εᵁᵢⱼ, yᵢ = argmaxⱼUᵢⱼ
+
+        Only relative utility is identified. The final class J-1 is therefore assigned zero reference utility. With D=J-1, the utility-difference model is:
+
+        $eta_i=X_i*beta+epsilon_i , epsilon_i~N_D(0,Sigma)$
+        ηᵢ = Xᵢβ + εᵢ, εᵢ ~ N_D(0,Σ)
+
+        $X_i in R^(D*p)$ (Xᵢ ∈ R^(D×p)) contains alternative-related covariates, $beta in R^p$ (β ∈ R^p) is shared by the non-reference rows, and the complete utility vector is $(eta_i^T,0)^T$ ((ηᵢᵀ,0)ᵀ). The caller must preserve alternative order, reference coding, feature order and any training-derived preprocessing during inference
+
+        Multiplying every utility by a positive constant leaves argmax unchanged, so the covariance scale is not identified. This component imposes $Sigma_00=1$ (Σ₀₀ = 1). The reference-utility constraint and scale constraint address different identification problems and both are required
+
+    (2) Scale-constrained Cholesky parameterization: instead of optimizing an unrestricted covariance matrix, the component writes:
+
+        $Sigma=L*L^T , L_00=1 , L_rr=exp(a_r)>0 for r>=1$
+        Σ = LLᵀ, L₀₀ = 1, Lᵣᵣ = exp(aᵣ) > 0 for r ≥ 1
+
+        The remaining lower-triangular entries are unrestricted. For D=3:
+
+        $L=[[1,0,0],[l_10,exp(a_1),0],[l_20,l_21,exp(a_2)]]$
+        L = [[1,0,0],[ℓ₁₀,eᵃ¹,0],[ℓ₂₀,ℓ₂₁,eᵃ²]]
+
+        This construction makes Sigma symmetric positive definite and automatically satisfies Sigma[0,0]=1. The free covariance-parameter count is $q=D*(D+1)/2-1$ (q = D(D+1)/2−1), and the complete unconstrained vector is theta=(beta,vartheta). Exponential inputs are clipped to [-20,20] only as overflow protection during trial optimization steps; persistent solutions at that boundary indicate a model, data or optimization problem
+
+    (3) Choice events as correlated normal negative orthants: let $B=[I_D;0^T]$ (B = [I_D;0ᵀ]) so U_i=B eta_i. For each candidate class y, construct A_y with rows e_k-e_y for every k!=y and define:
+
+        $C_y=A_y*B in R^(D*D) , V_i^(y)=C_y*eta_i$
+        C_y = A_yB ∈ R^(D×D), Vᵢ⁽ʸ⁾ = C_yηᵢ
+
+        Every coordinate of V_i^(y) is another alternative's utility minus the utility of y. Therefore:
+
+        $y_i=y if and only if C_y*eta_i<0$
+        yᵢ = y ⇔ C_yηᵢ < 0 coordinate-wise
+
+        $V_i^(y)~N_D(nu_y,S_y) , nu_y=C_y*mu_i , S_y=C_y*Sigma*C_y^T , mu_i=X_i*beta$
+        Vᵢ⁽ʸ⁾ ~ N_D(ν_y,S_y), ν_y = C_yμᵢ, S_y = C_yΣC_yᵀ, μᵢ = Xᵢβ
+
+        The cached _mnp_choice_contrasts helper constructs all C_y matrices. For D=2 and reference class 2, C_2=I, C_0 encodes eta_1-eta_0<0 and -eta_0<0, and C_1 encodes eta_0-eta_1<0 and -eta_1<0. All class probabilities can then use one GHK kernel
+
+    (4) GHK recursive conditional probabilities: for each class y, factor the transformed covariance as:
+
+        $S_y=Gamma*Gamma^T , V_i^(y)=nu_y+Gamma*z , z~N_D(0,I)$
+        S_y = ΓΓᵀ, Vᵢ⁽ʸ⁾ = ν_y + Γz, z ~ N_D(0,I)
+
+        Gamma is distinct from L: L parameterizes the original utility-difference covariance Sigma, whereas Gamma factorizes the class-transformed S_y for simulation. Requiring V_r<0 sequentially gives the conditional upper bound:
+
+        $b_r=-(nu_r+sum_(s<r)(Gamma_rs*z_s))/Gamma_rr$
+        bᵣ = −(νᵣ + Σₛ<ᵣΓᵣₛzₛ)/Γᵣᵣ
+
+        The r-th conditional probability is Phi(b_r), and a truncated standard normal coordinate is generated by inverse transformation:
+
+        $z_r=Phi^(-1)(u_r*Phi(b_r)) , u_r~Uniform(0,1)$
+        zᵣ = Φ⁻¹(uᵣΦ(bᵣ)), uᵣ ~ Uniform(0,1)
+
+        One path has weight $w=product_r Phi(b_r)$ (w = ΠᵣΦ(bᵣ)). R paths produce:
+
+        $P_hat_y=(1/R)*sum_m w^(m)$
+        P̂_y = (1/R)Σₘw⁽ᵐ⁾
+
+        $log(P_hat_y)=logsumexp_m(log(w^(m)))-log(R)$
+        log P̂_y = logsumexpₘ(log w⁽ᵐ⁾) − log R
+
+        log_ndtr computes log Phi directly in the tails, and logsumexp avoids underflow from explicit products and averages. ndtr, ndtri and uniform clipping protect inverse sampling; these numerical safeguards do not make extreme-tail simulation exact
+
+    (5) Fixed-draw simulated maximum likelihood: after generating uniforms U with shape (n,R,D), the component minimizes:
+
+        $L_S(theta)=-(1/n)*sum_i log(P_hat_(i,y_i)(theta;U))$
+        𝓛_S(θ) = −(1/n)Σᵢlog P̂ᵢ,ᵧᵢ(θ;U)
+
+        U remains fixed throughout optimization, making the objective deterministic, reproducible and differentiable as a function of theta. Training does not renormalize each row of simulated class probabilities, because the objective must remain the corresponding raw GHK simulated likelihood
+
+        Although the GHK probability estimator is unbiased over random draws, finite-R simulation generally gives $E(log(P_hat))!=log(E(P_hat))=log(P)$ (E[log P̂] ≠ log E[P̂] = log P). Fixed common random numbers stabilize optimization; they do not eliminate simulation error or finite-draw log-likelihood bias
+
+    (6) Automatic differentiation and BFGS: JAX differentiates through parameter unpacking, matrix products, both Cholesky levels, normal CDF/inverse CDF and logsumexp. BFGS uses these gradients and an inverse-Hessian approximation; no handwritten MNP gradient or explicit true Hessian is required. The main work is approximately $O(J*n*R*D^2)$ (O(JnRD²)), with small-matrix factorization and static-loop compilation overhead. The stored uniforms require $O(n*R*D)$ (O(nRD)) memory
+
+        The method is chosen for correlated-error fidelity and transparent simulation, not universal speed:
+
+        ============================  ============================================  ==========================================
+        Method                        Main property                                 Typical scenario
+        ============================  ============================================  ==========================================
+        Cholesky + GHK + MSL + BFGS   Correlated normal errors; automatic gradients  This reference implementation
+        Direct numerical integration  Deterministic and accurate in low dimensions  Very small D only
+        EM + GLS/QR                   Clear matrix-regression M step                 E step still needs truncated moments
+        Albert-Chib + Gibbs           Full Bayesian posterior and latent utilities   Bayesian rather than frequentist MSL
+        Binary Probit IRLS            Scalar normal-CDF likelihood and weights       Not the joint MNP regional integral
+        Mixed Logit + MSL             Flexible simulated choice model               Different error distribution and model
+        ============================  ============================================  ==========================================
+
+    Algorithm flow
+    --------------
+    .. code-block:: text
+
+        Input A(n,D,p), integer b(n,), simulation and BFGS controls
+            |
+            v
+        Validate finite dimensions and labels 0,...,D; final class = reference
+            |
+            v
+        Initialize beta=0 and L=I; Sigma[0,0]=1 by construction
+            |
+            v
+        Generate fixed uniforms U(n,R,D) once for the whole training run
+            |
+            v
+        theta -> beta,L -> Sigma=L@L.T -> mu=A@beta
+            |
+            v
+        For every class y: nu=C[y]@mu and S=C[y]@Sigma@C[y].T
+            |
+            v
+        Gamma=Cholesky(S) -> sequential b_r and truncated-normal z_r
+            |
+            v
+        Accumulate log Phi(b_r) -> logsumexp over R paths -> log P_hat(n,J)
+            |
+            v
+        Select observed-class log P_hat -> mean negative simulated likelihood
+            |
+            v
+        JAX automatic differentiation -> BFGS update -> convergence diagnostics
+            |
+            +------------> Save theta, beta, L, Sigma, NLL, status and gradient norm
+            |
+            v
+        Inference: independent uniforms -> same GHK kernel -> optional row normalization
+            |
+            +------------> predict_proba: (m,J); reasoning: int32 row-wise argmax
+
+    Step 1 (input and encoding): require non-empty finite A(n,D,p) and finite integer labels b(n,), with matching samples and labels in 0,...,D. D=J-1 determines the number of classes, so no redundant n_classes argument is needed. Labels are checked before conversion to int32
+
+    Step 2 (identification and initialization): use the final class as zero reference, fix L[0,0]=1 and start at beta=0,L=I. The initial covariance is independent and standard normal in the utility-difference space
+
+    Step 3 (common random numbers): generate the complete training uniform array from seed before BFGS. Every objective and gradient evaluation uses this same array, preventing the optimizer from chasing fresh simulation noise
+
+    Step 4 (parameter decoding): unpack theta into beta and lower-triangular L. Positive diagonal exponentials and fixed L[0,0] guarantee the required covariance structure; static Python loops depend only on D and p
+
+    Step 5 (class transformations): compute mu and every nu_y,S_y. The choice contrasts map each discrete selection event to a correlated normal negative-orthant probability
+
+    Step 6 (GHK simulation): Cholesky-factor each S_y, recursively evaluate conditional upper bounds, draw truncated normal coordinates and accumulate log conditional probabilities. Sample and path dimensions are vectorized; only static class and coordinate loops remain in Python
+
+    Step 7 (MSL objective): average each path's weights in the log domain, select the observed class and form mean negative simulated log-likelihood. Raw probabilities are not row-normalized inside the training objective
+
+    Step 8 (BFGS and diagnostics): JIT-compile the fixed-shape objective closed over A,b,U. JAX supplies gradients to jax.scipy.optimize.minimize. Save actual success/status, iteration count, gradient norm and initial/final NLL; reaching max_iter is not reported as convergence
+
+    Step 9 (trained state): retain theta for simulation and expose beta_hat, l_hat and sigma_hat=l_hat@l_hat.T for interpretation. Non-finite final parameters, objectives or gradients raise an explicit error
+
+    Step 10 (independent inference): generate fresh uniforms from inference_seed, evaluate all J class probabilities and optionally normalize in the log domain. Normalization enforces unit row sums under finite R but does not correct model misspecification or systematic simulation bias
+
+    Step 11 (classification): reasoning applies row-wise argmax to predict_proba and returns int32 zero-based labels. The reference class is an ordinary predicted class, not an 'other' or rejection category
+
+    Step 12 (verification): tests independently check parameter constraints, explicit choice contrasts, low-dimensional normal-CDF references, raw probability completeness, automatic differentiation, fixed-draw determinism, BFGS convergence, inference and error behavior. Accuracy alone is not treated as proof of correctness
+
+    JAX unique advantages
+    ---------------------
+    (1) End-to-end automatic differentiation of the simulated objective: Cholesky, einsum, ndtr, ndtri, log_ndtr and logsumexp remain in one differentiable computation graph. This avoids handwritten derivatives of regional normal probabilities with respect to both beta and covariance parameters
+
+    (2) Explicit functional random streams: PRNGKey separates data generation, training common random numbers, independent CDF checks and inference. Reusing a key reproduces the same numerical experiment; changing the inference key exposes reasonable simulation variation
+
+    (3) Selective JIT compilation: the training objective is compiled after static A,b,U shapes are closed over, and probability inference uses static draw-count, seed and normalization controls. Class and coordinate loops are statically unrolled. Shape changes can trigger recompilation
+
+    (4) Shared train/inference GHK kernel: both paths call _ghk_mnp_log_probs, reducing the risk of inconsistent choice contrasts or recursion. Different uniforms, rather than different statistical formulas, distinguish optimization from independent evaluation
+
+    (5) Stable matrix and log-domain primitives: Cholesky enforces the covariance factorization, log_ndtr evaluates normal tail log probabilities and logsumexp performs path averaging and normalized inference without explicitly dividing by a potentially zero raw probability sum
+
+    (6) Independent numerical verification: tests use only existing NumPy, standard-library erf and JAX. D=1 has an analytic normal-CDF reference; D=2 uses deterministic one-dimensional quadrature of a conditional normal probability. SciPy is not a runtime or mandatory test dependency
+
+    (7) Backend migration with explicit boundaries: matrix operations can run on supported JAX backends, but small-matrix Cholesky, static compilation, random algorithms and performance must be assessed per backend. CPU + float64 is the reference environment, and GPU execution is not automatically faster for small problems
+
+    Precautions
+    -----------
+    (1) Identification cannot be omitted: Cholesky guarantees positive definiteness but does not identify location or scale. Keep both the zero reference utility and Sigma[0,0]=1
+
+    (2) Interpret the estimated covariance correctly: Sigma is the covariance of utility differences relative to the final reference, not every element of the original complete-utility error covariance
+
+    (3) Finite R creates simulation error: increase num_draws and inference_num_draws and vary seeds for sensitivity analysis. Fixed random numbers improve optimization stability but do not remove finite-draw bias
+
+    (4) Do not normalize the training target: row normalization during training would change the raw GHK simulated likelihood. Inference normalization is only numerical presentation and does not repair estimation bias
+
+    (5) Tail clipping has limits: CDF and uniform floors prevent exact 0/1 inverse-CDF inputs, while diagonal clipping prevents exponential overflow. Extreme tails can still cause approximation error, vanishing gradients or slow convergence
+
+    (6) Positive definite does not mean well conditioned: Sigma can have a large condition number despite valid Cholesky factors. Inspect covariance eigenvalues, optimization diagnostics and simulation sensitivity for difficult data
+
+    (7) BFGS convergence is local: success and a small gradient do not establish a global optimum. Multiple initializations, alternative covariance starts or Multinomial Logit initialization may be useful in a separate application layer
+
+    (8) Hessian-based standard errors are not provided: the inverse approximate Hessian conditional on fixed draws is not automatically a correct frequentist standard-error estimator. Simulation-aware robust inference requires additional work
+
+    (9) Memory and compile time scale quickly: uniforms use O(nRD) storage and static J/D loops enlarge the compiled graph. Large samples, high class counts or high D require chunking, minibatches or a different estimator
+
+    (10) Preserve design semantics: all non-reference alternatives share beta in this parameterization. Individual-invariant covariates normally require alternative interactions or differences; otherwise they may cancel from utility differences
+
+    (11) Binary reduction is a special case: J=2 gives D=1 and no free covariance parameter. GHK then approximates the ordinary univariate Probit probability, but this component need not match QRProbitComponent's IRLS iterations or floating-point output exactly
+
+    (12) Convergence and accuracy are different checks: a finite objective or plausible accuracy does not prove correct choice contrasts or covariance transforms. Retain independent CDF, probability-completeness, gradient and constraint checks
+
+    (13) Reproducibility is backend-relative: explicit seeds make the reference workflow reproducible, but bitwise identity across JAX versions, random implementations, backends or hardware is not promised
+
+    (14) Production modeling is outside scope: missing-data handling, panel dependence, observation weights, arbitrary parameter restrictions, robust standard errors, calibration, serialization and formal model comparison require additional engineering
+
+    :example:
+        >>> import jax
+        >>> import jax.numpy as jnp
+        >>> from statjax.regression import GHKMultinomialProbitComponent
+        >>> # Generate reproducible three-class data; class 2 has zero reference utility
+        >>> key_A,key_error = jax.random.split(jax.random.PRNGKey(42))
+        >>> A = jax.random.normal(key_A,(400,2,3),dtype=jnp.float64)
+        >>> beta_true = jnp.array([0.8,-0.5,0.6],dtype=jnp.float64)
+        >>> L_true = jnp.array([[1.0,0.0],[0.35,0.8]],dtype=jnp.float64)
+        >>> z = jax.random.normal(key_error,(400,2),dtype=jnp.float64)
+        >>> utilities = jnp.concatenate([
+        ...     jnp.einsum("ndp,p->nd",A,beta_true) + z @ L_true.T,
+        ...     jnp.zeros((400,1),dtype=jnp.float64)
+        ... ],axis=1)
+        >>> b = jnp.argmax(utilities,axis=1).astype(jnp.int32)
+        >>> # Fixed draws stabilize training; inference uses an independent random stream
+        >>> component = GHKMultinomialProbitComponent(num_draws=128,inference_num_draws=512)
+        >>> theta_hat,metrics = component.train(A=A,b=b)
+        >>> probabilities = component.predict_proba(A_test=A[:10])
+        >>> y_pred = component.reasoning(A_test=A[:10])
+        >>> beta_hat = component.beta_hat
+        >>> Sigma_hat = component.sigma_hat
+
+    :reference:
+        - [Probit model](https://en.wikipedia.org/wiki/Probit_model)
+        - [Multinomial probit](https://en.wikipedia.org/wiki/Discrete_choice#Multinomial_probit)
+        - [Cholesky decomposition](https://en.wikipedia.org/wiki/Cholesky_decomposition)
+        - [BFGS algorithm](https://en.wikipedia.org/wiki/Broyden%E2%80%93Fletcher%E2%80%93Goldfarb%E2%80%93Shanno_algorithm)
+        - StatJAX007 Multinomial Probit Design Document `"StatJAX007 Multinomial Probit SH V001"<https://github.com/redblue0216/statjax>`_
+    '''
+
+    def __init__(self,num_draws=128,max_iter=100,grad_tol=1e-5,seed=123,inference_num_draws=1024,inference_seed=2027,normalize=True):
+        '''Attribute Function:
+
+            Initialize GHK simulation, BFGS optimization, independent inference controls and trained state
+
+        :parameters:
+            - num_draws (int) - Positive number of fixed training paths per observation
+            - max_iter (int) - Positive maximum number of BFGS iterations
+            - grad_tol (float) - Finite positive BFGS gradient tolerance
+            - seed (int) - Non-negative training random seed
+            - inference_num_draws (int) - Positive number of independent inference paths
+            - inference_seed (int) - Non-negative inference random seed
+            - normalize (bool) - Whether inference probabilities are normalized by row
+        '''
+
+        if not isinstance(num_draws,int) or isinstance(num_draws,bool) or num_draws < 1:
+            raise ValueError("num_draws must be a positive integer")
+        if not isinstance(max_iter,int) or isinstance(max_iter,bool) or max_iter < 1:
+            raise ValueError("max_iter must be a positive integer")
+        if not 0.0 < grad_tol < float("inf"):
+            raise ValueError("grad_tol must be finite and positive")
+        if not isinstance(seed,int) or isinstance(seed,bool) or seed < 0:
+            raise ValueError("seed must be a non-negative integer")
+        if not isinstance(inference_num_draws,int) or isinstance(inference_num_draws,bool) or inference_num_draws < 1:
+            raise ValueError("inference_num_draws must be a positive integer")
+        if not isinstance(inference_seed,int) or isinstance(inference_seed,bool) or inference_seed < 0:
+            raise ValueError("inference_seed must be a non-negative integer")
+        if not isinstance(normalize,bool):
+            raise ValueError("normalize must be a boolean")
+
+        self.num_draws = num_draws
+        self.max_iter = max_iter
+        self.grad_tol = grad_tol
+        self.seed = seed
+        self.inference_num_draws = inference_num_draws
+        self.inference_seed = inference_seed
+        self.normalize = normalize
+        self.theta_hat = None
+        self.beta_hat = None
+        self.l_hat = None
+        self.sigma_hat = None
+        self.metrics = None
+
+
+    def train(self,A,b):
+        '''Method Function:
+
+            Train correlated multinomial Probit parameters through Cholesky, GHK, MSL and BFGS
+
+        :parameters:
+            - A (jnp.ndarray) - (n,D,p) Alternative-related design tensor with D=J-1
+            - b (jnp.ndarray) - (n,) Integer class labels in 0,...,D
+
+        :return:
+            - theta_hat (jnp.ndarray) - Trained unconstrained parameter vector
+            - metrics (dict) - Simulated likelihood and BFGS convergence diagnostics
+        '''
+
+        A = jnp.asarray(A,dtype=jnp.float64)
+        b_values = jnp.asarray(b,dtype=jnp.float64)
+        if A.ndim != 3 or b_values.ndim != 1 or A.shape[0] != b_values.shape[0]:
+            raise ValueError("A must have shape (n,D,p), b must have shape (n,), and their sample counts must match")
+        if A.shape[0] == 0 or A.shape[1] == 0 or A.shape[2] == 0:
+            raise ValueError("A and b must be non-empty and A must contain positive D and p dimensions")
+        if not bool(jnp.all(jnp.isfinite(A))) or not bool(jnp.all(jnp.isfinite(b_values))):
+            raise ValueError("A and b must contain only finite values")
+        if not bool(jnp.all(b_values == jnp.trunc(b_values))):
+            raise ValueError("b must contain integer class labels")
+        d = A.shape[1]
+        if not bool(jnp.all((b_values >= 0) & (b_values <= d))):
+            raise ValueError("b must contain class labels in the range 0,...,D")
+        b = b_values.astype(jnp.int32)
+
+        result = _fit_ghk_multinomial_probit(
+            A,b,self.num_draws,self.max_iter,self.grad_tol,self.seed
+        )
+        self.theta_hat = result["theta_hat"]
+        self.beta_hat = result["beta_hat"]
+        self.l_hat = result["l_hat"]
+        self.sigma_hat = result["sigma_hat"]
+        self.metrics = {
+            "initial_nll": result["initial_nll"],
+            "final_nll": result["final_nll"],
+            "converged": result["converged"],
+            "status": result["status"],
+            "n_iter": result["n_iter"],
+            "grad_norm": result["grad_norm"],
+            "num_draws": self.num_draws,
+            "seed": self.seed
+        }
+
+        return self.theta_hat,self.metrics
+
+
+    def predict_proba(self,A_test):
+        '''Method Function:
+
+            Return independently simulated class probabilities using the trained parameters
+
+        :parameters:
+            - A_test (jnp.ndarray) - (m,D,p) Test design tensor with training dimensions and encoding
+
+        :return:
+            - probabilities (jnp.ndarray) - (m,J) Class probabilities in label order
+        '''
+
+        if self.theta_hat is None:
+            raise RuntimeError("GHKMultinomialProbitComponent has not been trained yet, please call the train method first")
+        A_test = jnp.asarray(A_test,dtype=jnp.float64)
+        if A_test.ndim != 3 or A_test.shape[1] != self.l_hat.shape[0] or A_test.shape[2] != self.beta_hat.shape[0]:
+            raise ValueError("A_test must have shape (m,D,p) with the same D and p dimensions as training data")
+        if A_test.shape[0] == 0:
+            raise ValueError("A_test must be non-empty")
+        if not bool(jnp.all(jnp.isfinite(A_test))):
+            raise ValueError("A_test must contain only finite values")
+
+        probabilities = _predict_ghk_mnp_proba(
+            A_test,self.theta_hat,self.inference_num_draws,self.inference_seed,self.normalize
+        )
+        if not bool(jnp.all(jnp.isfinite(probabilities))):
+            raise RuntimeError("GHK inference produced non-finite probabilities")
+
+        return probabilities
+
+
+    def reasoning(self,A_test):
+        '''Method Function:
+
+            Return int32 class predictions by row-wise argmax over simulated probabilities
+
+        :parameters:
+            - A_test (jnp.ndarray) - Test design tensor
+
+        :return:
+            - y_pred (jnp.ndarray) - (m,) Predicted class labels
+        '''
+
+        probabilities = self.predict_proba(A_test)
+        y_pred = jnp.argmax(probabilities,axis=1).astype(jnp.int32)
+
+        return y_pred
+
+
+    def _info(self):
+        '''Method Function:
+
+            Return component metadata
+
+        :parameters:
+            nothing
+
+        :return:
+            - info (str) - Text introduction of the component
+        '''
+
+        return "GHKMultinomialProbitComponent: multinomial Probit regression component based on scale-constrained Cholesky covariance, GHK simulation, simulated maximum likelihood and BFGS, implemented with the JAX technology stack"
 
 
 

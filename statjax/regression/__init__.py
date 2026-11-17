@@ -26,14 +26,14 @@ This is the public class interface of the regression module. It exposes independ
 
 - Main functions:
 
-    (1) Open OLS, ridge, LASSO, binary Logistic, binary Probit and multinomial Logistic components
+    (1) Open OLS, ridge, LASSO, binary Logistic, binary Probit, multinomial Logistic and multinomial Probit components
 
 Usage examples
 --------------
 .. code-block:: python
     :linenos:
 
-    from statjax.regression import HouseholderOLSComponent,SVDRidgeComponent,CDLassoComponent,QRLogisticComponent,QRProbitComponent,QRMultinomialLogisticComponent
+    from statjax.regression import HouseholderOLSComponent,SVDRidgeComponent,CDLassoComponent,QRLogisticComponent,QRProbitComponent,QRMultinomialLogisticComponent,GHKMultinomialProbitComponent
 
     ols_instance = HouseholderOLSComponent()
     x_hat,metrics = ols_instance.train(A=A_train,b=b_train)
@@ -66,6 +66,13 @@ Usage examples
     probabilities = multinomial_instance.predict_proba(A_test=A_multiclass_test)
     y_pred = multinomial_instance.reasoning(A_test=A_multiclass_test)
 
+    ### Multinomial Probit infers J=D+1 from A(n,D,p), with the final class as reference
+    mnp_instance = GHKMultinomialProbitComponent(num_draws=128)
+    theta_hat,metrics = mnp_instance.train(A=A_mnp_train,b=b_mnp_train)
+    ### GHK probabilities use independent inference draws and default row normalization
+    probabilities = mnp_instance.predict_proba(A_test=A_mnp_test)
+    y_pred = mnp_instance.reasoning(A_test=A_mnp_test)
+
 Class Description
 -----------------
 (1)TestRegression: This is a regression test placeholder component implementation class, the main function is to verify the framework link, the main technical inheritance
@@ -82,6 +89,8 @@ Class Description
 
 (7)QRMultinomialLogisticComponent: This is a multinomial Logistic regression component based on reference-category Softmax, jointly coupled IRLS, per-sample Cholesky whitening and handwritten column-pivoted Householder QR, with numerical-rank truncation, Armijo backtracking, K-class probability inference and argmax classification
 
+(8)GHKMultinomialProbitComponent: This is a multinomial Probit regression component based on scale-constrained Cholesky covariance, choice contrasts, GHK, fixed-common-random-number MSL and BFGS, with independent J-class probability inference and argmax classification
+
 References
 ----------
 StatJAX Design Document `"StatJAX Design SH V001"<https://github.com/redblue0216/statjax>`_
@@ -91,6 +100,8 @@ StatJAX004 Logistic Design Document `"StatJAX004 Logistic SH V001"<https://githu
 StatJAX005 Probit Design Document `"StatJAX005 Probit SH V001"<https://github.com/redblue0216/statjax>`_
 
 StatJAX006 Multinomial Logistic Design Document `"StatJAX006 Multinomial Logistic SH V001"<https://github.com/redblue0216/statjax>`_
+
+StatJAX007 Multinomial Probit Design Document `"StatJAX007 Multinomial Probit SH V001"<https://github.com/redblue0216/statjax>`_
 
 '''
 
@@ -104,7 +115,7 @@ StatJAX006 Multinomial Logistic Design Document `"StatJAX006 Multinomial Logisti
 ### Basic package
 ### Algorithm package
 ### Project Package - Algorithm Components
-from statjax.regression._components import TestRegression,HouseholderOLSComponent,SVDRidgeComponent,CDLassoComponent,QRLogisticComponent,QRProbitComponent,QRMultinomialLogisticComponent
+from statjax.regression._components import TestRegression,HouseholderOLSComponent,SVDRidgeComponent,CDLassoComponent,QRLogisticComponent,QRProbitComponent,QRMultinomialLogisticComponent,GHKMultinomialProbitComponent
 
 
 
@@ -118,6 +129,7 @@ from statjax.regression._components import TestRegression,HouseholderOLSComponen
 ### ------QRLogisticComponent
 ### ------QRProbitComponent
 ### ------QRMultinomialLogisticComponent
+### ------GHKMultinomialProbitComponent
 ###
 ################################################################################################################################################################################
 
@@ -135,7 +147,8 @@ __all__ = [
     "CDLassoComponent",
     "QRLogisticComponent",
     "QRProbitComponent",
-    "QRMultinomialLogisticComponent"
+    "QRMultinomialLogisticComponent",
+    "GHKMultinomialProbitComponent"
 ]
 
 

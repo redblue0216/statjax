@@ -58,7 +58,7 @@ python build.py --clean --install
 import jax
 import jax.numpy as jnp
 from jax.scipy.stats import norm
-from statjax.regression import HouseholderOLSComponent, SVDRidgeComponent, CDLassoComponent, QRLogisticComponent, QRProbitComponent, QRMultinomialLogisticComponent
+from statjax.regression import HouseholderOLSComponent, SVDRidgeComponent, CDLassoComponent, QRLogisticComponent, QRProbitComponent, QRMultinomialLogisticComponent, GHKMultinomialProbitComponent
 
 # Prepare the training data (column full rank design matrix A and observation labels b)
 A_train = jax.random.normal(jax.random.PRNGKey(0), (100, 5))
@@ -110,6 +110,22 @@ multinomial = QRMultinomialLogisticComponent(n_classes=3, l2=1e-4)
 theta_hat, metrics = multinomial.train(A=A_train, b=multi_labels)
 probabilities = multinomial.predict_proba(A_test=A_train)  # (n, 3), reference class last
 class_pred = multinomial.reasoning(A_test=A_train)         # int32 argmax labels
+
+# Train multinomial Probit on A(n,D,p); D=J-1 and the final class is the reference
+mnp_keys = jax.random.split(jax.random.PRNGKey(5), 2)
+A_mnp = jax.random.normal(mnp_keys[0], (100, 2, 3), dtype=jnp.float64)
+mnp_errors = jax.random.normal(mnp_keys[1], (100, 2), dtype=jnp.float64)
+mnp_beta = jnp.array([0.8, -0.5, 0.6], dtype=jnp.float64)
+mnp_L = jnp.array([[1.0, 0.0], [0.35, 0.8]], dtype=jnp.float64)
+mnp_utilities = jnp.concatenate([
+    jnp.einsum("ndp,p->nd", A_mnp, mnp_beta) + mnp_errors @ mnp_L.T,
+    jnp.zeros((100, 1), dtype=jnp.float64),
+], axis=1)
+mnp_labels = jnp.argmax(mnp_utilities, axis=1).astype(jnp.int32)
+mnp = GHKMultinomialProbitComponent(num_draws=128)
+mnp_theta, metrics = mnp.train(A=A_mnp, b=mnp_labels)
+probabilities = mnp.predict_proba(A_test=A_mnp)  # (n, 3), independent inference draws
+class_pred = mnp.reasoning(A_test=A_mnp)         # int32 argmax labels
 ```
 
 Runnable end-to-end demos:
@@ -121,6 +137,7 @@ python example/example_003.py   # LASSO (coordinate descent)
 python example/example_004.py   # Binary Logistic regression (IRLS + pivoted QR)
 python example/example_005.py   # Binary Probit regression (Fisher scoring + pivoted QR)
 python example/example_006.py   # Multinomial Logistic regression (whitened IRLS + handwritten pivoted QR)
+python example/example_007.py   # Multinomial Probit regression (Cholesky + GHK + MSL + BFGS)
 ```
 
 Run unit tests:
@@ -130,11 +147,11 @@ pip install pytest
 python -m pytest -v
 ```
 
-For the complete self-test process from scratch, see [StatJAX自我测试完整流程_SH_V006.md](design/StatJAX自我测试完整流程_SH_V006.md).
+For the complete self-test process from scratch, see [StatJAX自我测试完整流程_SH_V007.md](design/StatJAX自我测试完整流程_SH_V007.md).
 
 ### 3.3 design
 <details>
-<summary>Click to view design documents (18 files)</summary>
+<summary>Click to view design documents (21 files)</summary>
 
 | File | Description |
 |:----|:----|
@@ -151,11 +168,14 @@ For the complete self-test process from scratch, see [StatJAX自我测试完整�
 | [StatJAX005_Probit_SH_V001.md](design/StatJAX005_Probit_SH_V001.md) | Probit algorithm document: Fisher scoring, column-pivoted Householder QR and Armijo step halving |
 | [StatJAX006_实施方案_SH_V001.md](design/StatJAX006_实施方案_SH_V001.md) | Implementation plan for the StatJAX006 iteration |
 | [StatJAX006_多分类logistic_SH_V001.md](design/StatJAX006_多分类logistic_SH_V001.md) | Multinomial Logistic algorithm document: reference-category Softmax, whitened IRLS, handwritten pivoted QR and Armijo backtracking |
+| [StatJAX007_实施方案_SH_V001.md](design/StatJAX007_实施方案_SH_V001.md) | Implementation plan for the StatJAX007 iteration |
+| [StatJAX007_多分类probit_SH_V001.md](design/StatJAX007_多分类probit_SH_V001.md) | Multinomial Probit algorithm document: scale-constrained Cholesky, GHK, fixed-draw MSL and automatic-differentiation BFGS |
 | [StatJAX自我测试完整流程_SH_V002.md](design/StatJAX自我测试完整流程_SH_V002.md) | Complete self-test process of StatJAX from scratch (for statjax 0.2.1) |
 | [StatJAX自我测试完整流程_SH_V003.md](design/StatJAX自我测试完整流程_SH_V003.md) | Complete self-test process of StatJAX from scratch (for statjax 0.3.1) |
 | [StatJAX自我测试完整流程_SH_V004.md](design/StatJAX自我测试完整流程_SH_V004.md) | Complete self-test process of StatJAX from scratch (for statjax 0.4.1) |
 | [StatJAX自我测试完整流程_SH_V005.md](design/StatJAX自我测试完整流程_SH_V005.md) | Complete self-test process of StatJAX from scratch (for statjax 0.5.1) |
 | [StatJAX自我测试完整流程_SH_V006.md](design/StatJAX自我测试完整流程_SH_V006.md) | Complete self-test process of StatJAX from scratch (for statjax 0.6.1) |
+| [StatJAX自我测试完整流程_SH_V007.md](design/StatJAX自我测试完整流程_SH_V007.md) | Complete self-test process of StatJAX from scratch (for statjax 0.7.1) |
 </details>
 
 ## 4.algorithm
@@ -169,10 +189,18 @@ For the complete self-test process from scratch, see [StatJAX自我测试完整�
 | regression | QRLogisticComponent | Binary Logistic regression with mean cross-entropy and L2-regularized weights, solved by IRLS and column-pivoted Householder QR with numerical-rank truncation and Armijo backtracking | Stable logaddexp loss; unpenalized intercept; training-only standardization; two-column probabilities and binary classes; selective JIT for loss, gradient and inference, while dynamic-rank QR remains host-controlled |
 | regression | QRProbitComponent | Unregularized binary Probit maximum-likelihood estimation solved by Fisher scoring/IRLS and column-pivoted Householder QR, with numerical-rank errors and Armijo step halving | Stable normal log-CDF likelihood; caller-prepared intercept and preprocessing; two-column normal-CDF probabilities and binary classes; selective JIT matrix kernels with host-controlled diagnostics |
 | regression | QRMultinomialLogisticComponent | Multinomial Logistic regression with reference-category Softmax and unaveraged L2-regularized cross-entropy, solved by jointly coupled IRLS, per-sample Cholesky whitening and handwritten column-pivoted Householder QR with Armijo backtracking | Explicit K and training-only standardization; unpenalized intercepts; K-column probabilities and int32 argmax classes; selective JIT matrix kernels with host-controlled line search; intended for small and medium dense data |
+| regression | GHKMultinomialProbitComponent | Correlated multinomial Probit regression with a final reference class and Sigma[0,0]=1, solved by scale-constrained Cholesky parameterization, class contrasts, GHK simulation, fixed-common-random-number MSL and automatic-differentiation BFGS | Three-dimensional A(n,D,p) with D=J-1; caller-controlled alternative encoding and preprocessing; J-column probabilities from independent inference draws with optional row normalization; int32 argmax classes; intended for small and medium dense data |
 
 ## 5.ChangeLog
 <details>
 <summary>Click to view ChangeLog</summary>
+
+### Version-0.7.1
+  - Added the regression component GHKMultinomialProbitComponent (scale-constrained Cholesky, class contrasts, GHK, fixed-draw MSL and automatic-differentiation BFGS)
+  - Added the unit test file statjax/tests/test_multinomial_probit.py with 17 numerical, simulation, inference and validation tests
+  - Updated example/example_007.py to use the public component and NumPy-based independent CDF checks without a SciPy dependency
+  - Deepened project-wide comments, integrating the overall design and multinomial Probit algorithm document (StatJAX007)
+  - Updated the self-test process document to StatJAX自我测试完整流程_SH_V007.md
 
 ### Version-0.6.1
   - Added the regression component QRMultinomialLogisticComponent (reference-category Softmax, jointly coupled IRLS, per-sample whitening and handwritten column-pivoted Householder QR)

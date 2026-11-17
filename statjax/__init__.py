@@ -88,7 +88,7 @@ Usage examples
 .. code-block:: python
     :linenos:
 
-    from statjax.regression import HouseholderOLSComponent,QRLogisticComponent,QRProbitComponent,QRMultinomialLogisticComponent
+    from statjax.regression import HouseholderOLSComponent,QRLogisticComponent,QRProbitComponent,QRMultinomialLogisticComponent,GHKMultinomialProbitComponent
 
     ### Train the OLS model and solve the optimal regression coefficients
     ols_instance = HouseholderOLSComponent()
@@ -114,6 +114,13 @@ Usage examples
     ### K-class probabilities are returned in label order and reasoning applies argmax
     probabilities = multinomial_instance.predict_proba(A_test=A_multiclass_test)
     y_pred = multinomial_instance.reasoning(A_test=A_multiclass_test)
+
+    ### Multinomial Probit uses A(n,D,p), D=J-1 and the final class as reference
+    mnp_instance = GHKMultinomialProbitComponent(num_draws=128)
+    theta_hat,metrics = mnp_instance.train(A=A_mnp_train,b=b_mnp_train)
+    ### Fixed training draws and independent inference draws have distinct statistical roles
+    probabilities = mnp_instance.predict_proba(A_test=A_mnp_test)
+    y_pred = mnp_instance.reasoning(A_test=A_mnp_test)
 
 Class Description
 -----------------
@@ -152,13 +159,13 @@ def _read_version() -> str:
         text = pyproject.read_text(encoding='utf-8')
         import re as _re
         m = _re.search(r'^version\s*=\s*"([^"]+)"', text, _re.M)
-        return m.group(1) if m else '0.6.1'
+        return m.group(1) if m else '0.7.1'
     except Exception:
         pass
     try:
         return _im.version('statjax')
     except Exception:
-        return '0.6.1'
+        return '0.7.1'
 
 
 

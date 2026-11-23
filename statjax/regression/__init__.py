@@ -26,14 +26,14 @@ This is the public class interface of the regression module. It exposes independ
 
 - Main functions:
 
-    (1) Open OLS, ridge, LASSO, binary Logistic, binary Probit, multinomial Logistic and multinomial Probit components
+    (1) Open OLS, ridge, LASSO, binary Logistic, binary Probit, multinomial Logistic, multinomial Probit and RBF support vector regression components
 
 Usage examples
 --------------
 .. code-block:: python
     :linenos:
 
-    from statjax.regression import HouseholderOLSComponent,SVDRidgeComponent,CDLassoComponent,QRLogisticComponent,QRProbitComponent,QRMultinomialLogisticComponent,GHKMultinomialProbitComponent
+    from statjax.regression import HouseholderOLSComponent,SVDRidgeComponent,CDLassoComponent,QRLogisticComponent,QRProbitComponent,QRMultinomialLogisticComponent,GHKMultinomialProbitComponent,SMOSVRComponent
 
     ols_instance = HouseholderOLSComponent()
     x_hat,metrics = ols_instance.train(A=A_train,b=b_train)
@@ -73,6 +73,11 @@ Usage examples
     probabilities = mnp_instance.predict_proba(A_test=A_mnp_test)
     y_pred = mnp_instance.reasoning(A_test=A_mnp_test)
 
+    ### RBF SVR uses the same train / reasoning contract and returns continuous predictions
+    svr_instance = SMOSVRComponent(C=10.0,epsilon=0.05,gamma=0.5)
+    beta_hat,metrics = svr_instance.train(A=A_svr_train,b=b_svr_train)
+    y_pred = svr_instance.reasoning(A_test=A_svr_test)
+
 Class Description
 -----------------
 (1)TestRegression: This is a regression test placeholder component implementation class, the main function is to verify the framework link, the main technical inheritance
@@ -91,6 +96,8 @@ Class Description
 
 (8)GHKMultinomialProbitComponent: This is a multinomial Probit regression component based on scale-constrained Cholesky covariance, choice contrasts, GHK, fixed-common-random-number MSL and BFGS, with independent J-class probability inference and argmax classification
 
+(9)SMOSVRComponent: This is an RBF support vector regression component based on compact-dual second-order SMO, exact pair subproblems, KKT diagnostics and sparse support-vector inference
+
 References
 ----------
 StatJAX Design Document `"StatJAX Design SH V001"<https://github.com/redblue0216/statjax>`_
@@ -102,6 +109,8 @@ StatJAX005 Probit Design Document `"StatJAX005 Probit SH V001"<https://github.co
 StatJAX006 Multinomial Logistic Design Document `"StatJAX006 Multinomial Logistic SH V001"<https://github.com/redblue0216/statjax>`_
 
 StatJAX007 Multinomial Probit Design Document `"StatJAX007 Multinomial Probit SH V001"<https://github.com/redblue0216/statjax>`_
+
+StatJAX008 Support Vector Regression Design Document `"StatJAX008 SVM SH V001"<https://github.com/redblue0216/statjax>`_
 
 '''
 
@@ -115,7 +124,7 @@ StatJAX007 Multinomial Probit Design Document `"StatJAX007 Multinomial Probit SH
 ### Basic package
 ### Algorithm package
 ### Project Package - Algorithm Components
-from statjax.regression._components import TestRegression,HouseholderOLSComponent,SVDRidgeComponent,CDLassoComponent,QRLogisticComponent,QRProbitComponent,QRMultinomialLogisticComponent,GHKMultinomialProbitComponent
+from statjax.regression._components import TestRegression,HouseholderOLSComponent,SVDRidgeComponent,CDLassoComponent,QRLogisticComponent,QRProbitComponent,QRMultinomialLogisticComponent,GHKMultinomialProbitComponent,SMOSVRComponent
 
 
 
@@ -130,6 +139,7 @@ from statjax.regression._components import TestRegression,HouseholderOLSComponen
 ### ------QRProbitComponent
 ### ------QRMultinomialLogisticComponent
 ### ------GHKMultinomialProbitComponent
+### ------SMOSVRComponent
 ###
 ################################################################################################################################################################################
 
@@ -148,7 +158,8 @@ __all__ = [
     "QRLogisticComponent",
     "QRProbitComponent",
     "QRMultinomialLogisticComponent",
-    "GHKMultinomialProbitComponent"
+    "GHKMultinomialProbitComponent",
+    "SMOSVRComponent"
 ]
 
 

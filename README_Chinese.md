@@ -58,7 +58,7 @@ python build.py --clean --install
 import jax
 import jax.numpy as jnp
 from jax.scipy.stats import norm
-from statjax.regression import HouseholderOLSComponent, SVDRidgeComponent, CDLassoComponent, QRLogisticComponent, QRProbitComponent, QRMultinomialLogisticComponent, GHKMultinomialProbitComponent
+from statjax.regression import HouseholderOLSComponent, SVDRidgeComponent, CDLassoComponent, QRLogisticComponent, QRProbitComponent, QRMultinomialLogisticComponent, GHKMultinomialProbitComponent, SMOSVRComponent
 
 # 准备训练数据（列满秩设计矩阵A与观测标签b）
 A_train = jax.random.normal(jax.random.PRNGKey(0), (100, 5))
@@ -126,6 +126,13 @@ mnp = GHKMultinomialProbitComponent(num_draws=128)
 mnp_theta, metrics = mnp.train(A=A_mnp, b=mnp_labels)
 probabilities = mnp.predict_proba(A_test=A_mnp)  # (n, 3)，使用独立推理随机数
 class_pred = mnp.reasoning(A_test=A_mnp)         # int32类型的argmax类别
+
+# 训练精确RBF支持向量回归，SMO循环由JAX完整编译
+A_svr = jnp.linspace(-3.0, 3.0, 40, dtype=jnp.float64)[:, None]
+b_svr = jnp.sin(A_svr[:, 0])
+svr = SMOSVRComponent(C=10.0, epsilon=0.05, gamma=0.5)
+svr_beta, metrics = svr.train(A=A_svr, b=b_svr)  # 完整紧凑对偶，形状(40,)
+y_pred = svr.reasoning(A_test=A_svr)             # 原始标签尺度，形状(40,)
 ```
 
 可运行的端到端演示：
@@ -138,6 +145,7 @@ python example/example_004.py   # 二分类Logistic回归（IRLS + 列主元QR�
 python example/example_005.py   # 二分类Probit回归（Fisher scoring + 列主元QR）
 python example/example_006.py   # 多分类Logistic回归（白化IRLS + 手写列主元QR）
 python example/example_007.py   # 多分类Probit回归（Cholesky + GHK + MSL + BFGS）
+python example/example_008.py   # RBF支持向量回归（二阶SMO）
 ```
 
 运行单元测试：
@@ -147,11 +155,11 @@ pip install pytest
 python -m pytest -v
 ```
 
-从零开始的完整自我测试流程见 [StatJAX自我测试完整流程_SH_V007.md](design/StatJAX自我测试完整流程_SH_V007.md)。
+从零开始的完整自我测试流程见 [StatJAX自我测试完整流程_SH_V008.md](design/StatJAX自我测试完整流程_SH_V008.md)。
 
 ### 3.3 设计
 <details>
-<summary>点击查看设计文档（共21份）</summary>
+<summary>点击查看设计文档（共24份）</summary>
 
 | 文件 | 说明 |
 |:----|:----|
@@ -170,12 +178,15 @@ python -m pytest -v
 | [StatJAX006_多分类logistic_SH_V001.md](design/StatJAX006_多分类logistic_SH_V001.md) | 多分类Logistic算法文档：参考类别Softmax、白化IRLS、手写列主元QR与Armijo回溯 |
 | [StatJAX007_实施方案_SH_V001.md](design/StatJAX007_实施方案_SH_V001.md) | StatJAX007迭代的实施方案 |
 | [StatJAX007_多分类probit_SH_V001.md](design/StatJAX007_多分类probit_SH_V001.md) | 多分类Probit算法文档：尺度约束Cholesky、GHK、固定抽样MSL与自动微分BFGS |
+| [StatJAX008_实施方案_SH_V001.md](design/StatJAX008_实施方案_SH_V001.md) | StatJAX008迭代的实施方案 |
+| [StatJAX008_SVM_SH_V001.md](design/StatJAX008_SVM_SH_V001.md) | 支持向量回归算法文档：RBF核、紧凑对偶、二阶SMO与全编译设备侧迭代 |
 | [StatJAX自我测试完整流程_SH_V002.md](design/StatJAX自我测试完整流程_SH_V002.md) | StatJAX从零开始的完整自我测试流程（适用于statjax 0.2.1） |
 | [StatJAX自我测试完整流程_SH_V003.md](design/StatJAX自我测试完整流程_SH_V003.md) | StatJAX从零开始的完整自我测试流程（适用于statjax 0.3.1） |
 | [StatJAX自我测试完整流程_SH_V004.md](design/StatJAX自我测试完整流程_SH_V004.md) | StatJAX从零开始的完整自我测试流程（适用于statjax 0.4.1） |
 | [StatJAX自我测试完整流程_SH_V005.md](design/StatJAX自我测试完整流程_SH_V005.md) | StatJAX从零开始的完整自我测试流程（适用于statjax 0.5.1） |
 | [StatJAX自我测试完整流程_SH_V006.md](design/StatJAX自我测试完整流程_SH_V006.md) | StatJAX从零开始的完整自我测试流程（适用于statjax 0.6.1） |
 | [StatJAX自我测试完整流程_SH_V007.md](design/StatJAX自我测试完整流程_SH_V007.md) | StatJAX从零开始的完整自我测试流程（适用于statjax 0.7.1） |
+| [StatJAX自我测试完整流程_SH_V008.md](design/StatJAX自我测试完整流程_SH_V008.md) | StatJAX从零开始的完整自我测试流程（适用于statjax 0.8.1） |
 </details>
 
 ## 4.算法
@@ -190,10 +201,18 @@ python -m pytest -v
 | regression | QRProbitComponent | 无正则二分类Probit最大似然估计，通过Fisher scoring/IRLS与列主元Householder QR求解，并结合数值秩报错和Armijo步长减半 | 正态log-CDF稳定似然；截距与预处理由调用方准备；输出双列正态CDF概率与0/1类别；矩阵内核选择性JIT，秩诊断由主机控制 |
 | regression | QRMultinomialLogisticComponent | 参考类别Softmax与未平均L2正则交叉熵的多分类Logistic回归，通过联合IRLS、逐样本Cholesky白化和手写列主元Householder QR求解，并结合Armijo回溯 | 显式K与训练集标准化；截距不正则化；输出K列概率与int32 argmax类别；矩阵内核选择性JIT，线搜索由主机控制；面向中小规模稠密数据 |
 | regression | GHKMultinomialProbitComponent | 以最后一类为基准并固定Sigma[0,0]=1的相关多分类Probit回归，通过尺度约束Cholesky参数化、类别对比矩阵、GHK模拟、固定公共随机数MSL与自动微分BFGS求解 | 三维输入A(n,D,p)，D=J-1；选项编码与预处理由调用方负责；独立推理随机数输出J列概率，可选行归一化；输出int32 argmax类别；面向中小规模稠密数据 |
+| regression | SMOSVRComponent | 精确RBF支持向量回归，通过紧凑对偶、KKT最大违反选择、二阶工作集和精确分段二次成对更新求解 | 仅使用训练集标准化X/y；O(n)梯度增量更新；lax.while_loop完整JIT编译；支持向量稀疏预测与逆标准化；O(n²)核内存，面向中小规模稠密数据 |
 
 ## 5.ChangeLog
 <details>
 <summary>点击查看ChangeLog</summary>
+
+### Version-0.8.1
+  - 新增回归组件SMOSVRComponent（RBF核、紧凑对偶、二阶SMO、精确成对子问题与全编译lax.while_loop）
+  - 新增单元测试文件statjax/tests/test_svr.py，包含17个核、KKT、对偶约束、推理与输入校验测试
+  - 更新example/example_008.py以调用公开组件，并加入可复现性和数值诊断断言
+  - 深化全项目注释，整合整体设计与支持向量回归算法文档（StatJAX008）内容
+  - 自我测试流程文档更新为《StatJAX自我测试完整流程_SH_V008.md》
 
 ### Version-0.7.1
   - 新增回归组件GHKMultinomialProbitComponent（尺度约束Cholesky、类别对比矩阵、GHK、固定抽样MSL与自动微分BFGS）

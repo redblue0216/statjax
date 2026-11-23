@@ -12,7 +12,7 @@
 Module Introduction
 -------------------
 
-This is a collection of concrete regression, binary-classification and multiclass-classification implementation classes. Each algorithm is mounted as an independent Component under BaseRegression, preserving the overall Base / Component / Algo architecture
+This is a collection of concrete regression, support vector regression, binary-classification and multiclass-classification implementation classes. Each algorithm is mounted as an independent Component under BaseRegression, preserving the overall Base / Component / Algo architecture
 
 - Design mode:
 
@@ -26,6 +26,8 @@ This is a collection of concrete regression, binary-classification and multiclas
 
     (3) Scale-constrained Cholesky covariance parameters, class-specific negative-orthant contrasts, GHK truncated-normal simulation, fixed-common-random-number MSL and automatic-differentiation BFGS for correlated multinomial Probit utilities
 
+    (4) RBF kernel matrices, compact SVR dual variables, KKT working-set selection, exact piecewise-quadratic pair subproblems, O(n) gradient updates and fully compiled lax.while_loop SMO iteration
+
 - Main functions:
 
     (1) Linear regression, regularized regression and sparse regression
@@ -34,12 +36,14 @@ This is a collection of concrete regression, binary-classification and multiclas
 
     (3) Multinomial Logistic and multinomial Probit K-class probability inference and argmax classification
 
+    (4) Exact small and medium dense RBF support vector regression with sparse support-vector inference
+
 Usage examples
 --------------
 .. code-block:: python
     :linenos:
 
-    from statjax.regression import HouseholderOLSComponent,SVDRidgeComponent,CDLassoComponent,QRLogisticComponent,QRProbitComponent,QRMultinomialLogisticComponent,GHKMultinomialProbitComponent
+    from statjax.regression import HouseholderOLSComponent,SVDRidgeComponent,CDLassoComponent,QRLogisticComponent,QRProbitComponent,QRMultinomialLogisticComponent,GHKMultinomialProbitComponent,SMOSVRComponent
 
     ### Train the OLS model and solve the optimal regression coefficients
     ols_instance = HouseholderOLSComponent()
@@ -86,6 +90,12 @@ Usage examples
     probabilities = mnp_instance.predict_proba(A_test=A_mnp_test)
     y_pred = mnp_instance.reasoning(A_test=A_mnp_test)
 
+    ### RBF SVR returns the complete compact dual vector and continuous predictions
+    svr_instance = SMOSVRComponent(C=10.0,epsilon=0.05,gamma=0.5)
+    beta_hat,metrics = svr_instance.train(A=A_svr_train,b=b_svr_train)
+    ### The support vectors and dual coefficients are retained for sparse inference
+    y_pred = svr_instance.reasoning(A_test=A_svr_test)
+
 Class Description
 -----------------
 (1)TestRegression: This is a regression test placeholder component implementation class, the main function is to verify the framework link, the main technical inheritance
@@ -103,6 +113,8 @@ Class Description
 (7)QRMultinomialLogisticComponent: This is a multinomial Logistic regression component based on reference-category Softmax, jointly coupled IRLS, per-sample Cholesky whitening and handwritten column-pivoted Householder QR, the main functions are L2-regularized training, numerical-rank truncation, Armijo-protected updates, K-class probability inference and argmax classification
 
 (8)GHKMultinomialProbitComponent: This is a correlated multinomial Probit component based on scale-constrained Cholesky covariance parameters, GHK choice-probability simulation, fixed-draw MSL and BFGS, with independent inference draws, J-class probabilities and argmax classification
+
+(9)SMOSVRComponent: This is an RBF support vector regression component based on compact-dual second-order SMO, exact pair subproblems, KKT convergence checks, sparse support-vector inference and a fully compiled lax.while_loop
 
 References
 ----------
@@ -134,6 +146,14 @@ References
 
 - [Backtracking line search](https://en.wikipedia.org/wiki/Backtracking_line_search)
 
+- [Support vector regression](https://en.wikipedia.org/wiki/Support_vector_machine#Regression)
+
+- [Sequential minimal optimization](https://en.wikipedia.org/wiki/Sequential_minimal_optimization)
+
+- [Radial basis function kernel](https://en.wikipedia.org/wiki/Radial_basis_function_kernel)
+
+- [Karush-Kuhn-Tucker conditions](https://en.wikipedia.org/wiki/Karush%E2%80%93Kuhn%E2%80%93Tucker_conditions)
+
 - StatJAX001 OLS Design Document `"StatJAX001 OLS SH V003"<https://github.com/redblue0216/statjax>`_
 
 - StatJAX002 Ridge Regression Design Document `"StatJAX002 Ridge SH V002"<https://github.com/redblue0216/statjax>`_
@@ -147,6 +167,8 @@ References
 - StatJAX006 Multinomial Logistic Design Document `"StatJAX006 Multinomial Logistic SH V001"<https://github.com/redblue0216/statjax>`_
 
 - StatJAX007 Multinomial Probit Design Document `"StatJAX007 Multinomial Probit SH V001"<https://github.com/redblue0216/statjax>`_
+
+- StatJAX008 Support Vector Regression Design Document `"StatJAX008 SVM SH V001"<https://github.com/redblue0216/statjax>`_
 '''
 
 
@@ -158,6 +180,7 @@ References
 
 ### Basic package
 from functools import lru_cache
+from typing import NamedTuple
 from statjax.regression._base import BaseRegression 
 ### Algorithm package
 import jax
@@ -203,6 +226,9 @@ jax.config.update("jax_enable_x64",True)
 ###
 ### class:GHKMultinomialProbitComponent
 ### ------This is a correlated multinomial Probit regression component based on scale-constrained Cholesky covariance parameters, class contrasts, GHK, fixed-draw MSL and BFGS, with independent probability inference and argmax classification
+###
+### class:SMOSVRComponent
+### ------This is an RBF support vector regression component based on compact-dual second-order SMO, exact pair subproblems, KKT diagnostics and fully compiled device-side iteration
 ###
 ################################################################################################################################################################################
 
@@ -886,6 +912,11 @@ def _one_sweep(X,beta,r,col_sq,lam):
     p = X.shape[1]
 
     def body(j,carry):
+        '''Method Function:
+
+            Perform one Gauss-Seidel coordinate update and its rank-1 residual correction inside lax.fori_loop
+        '''
+
         beta,r = carry
         ### Take the j-th column
         xj = X[:,j]
@@ -939,6 +970,11 @@ def _fit_lasso(X,y,lam,sweeps):
     col_sq = jnp.sum(Xs ** 2,axis=0)
 
     def sweep_loop(i,carry):
+        '''Method Function:
+
+            Apply one complete coordinate sweep while threading immutable beta and residual state through the compiled outer loop
+        '''
+
         beta,r = carry
         return _one_sweep(Xs,beta,r,col_sq,lam)
 
@@ -2699,6 +2735,11 @@ def _build_multinomial_irls_system(theta,Phi,Y,penalty,n_classes,l2,probability_
     L = jnp.linalg.cholesky(S)
 
     def per_sample(L_i,x_i,eta_i,error_i):
+        '''Method Function:
+
+            Construct one Cholesky-whitened multinomial IRLS design block and triangular-solved response for jax.vmap
+        '''
+
         ### Row-major theta requires phi_i.T kron I_q
         base_design = jnp.kron(x_i[None,:],eye_q)
         A_i = L_i.T @ base_design
@@ -2871,6 +2912,11 @@ def _fit_qr_multinomial_logistic(A,b,n_classes,l2,max_iter,tolerance,rank_tol,pr
     )
 
     def irls_candidate(value):
+        '''Method Function:
+
+            Build and solve the coupled whitened IRLS system for one prospective multinomial parameter update
+        '''
+
         A_system,c_system = _build_multinomial_irls_system(
             value,Phi,Y,penalty,n_classes,l2,probability_floor,weight_jitter
         )
@@ -4073,6 +4119,779 @@ class GHKMultinomialProbitComponent(BaseRegression):
         '''
 
         return "GHKMultinomialProbitComponent: multinomial Probit regression component based on scale-constrained Cholesky covariance, GHK simulation, simulated maximum likelihood and BFGS, implemented with the JAX technology stack"
+
+
+
+##############################################################################################################################################################################
+##############################################################################################################################################################################
+
+
+
+def _svr_rbf_kernel(X,Z,gamma):
+    '''Method Function:
+
+        Define an RBF kernel matrix using vectorized squared Euclidean distances:
+
+        $K_ij=exp(-gamma*||X_i-Z_j||_2^2)$
+        Kᵢⱼ = exp(−γ‖Xᵢ−Zⱼ‖₂²)
+
+        The distance identity $||X_i-Z_j||^2=||X_i||^2+||Z_j||^2-2*X_i^T*Z_j$ (‖Xᵢ−Zⱼ‖² = ‖Xᵢ‖²+‖Zⱼ‖²−2XᵢᵀZⱼ) replaces Python sample loops with matrix multiplication. Clipping negative round-off distances to zero preserves the fixed-shape exponential calculation
+
+    :parameters:
+        - X (jnp.ndarray) - (n,p) First feature matrix
+        - Z (jnp.ndarray) - (m,p) Second feature matrix
+        - gamma (float) - Positive RBF kernel scale
+
+    :return:
+        - kernel (jnp.ndarray) - (n,m) RBF kernel matrix
+    '''
+
+    x_squared = jnp.sum(X * X,axis=1)[:,None]
+    z_squared = jnp.sum(Z * Z,axis=1)[None,:]
+    distance_squared = x_squared + z_squared - 2.0 * (X @ Z.T)
+    distance_squared = jnp.maximum(distance_squared,0.0)
+
+    return jnp.exp(-gamma * distance_squared)
+
+
+
+def _svr_kkt_bounds(beta,grad,C,epsilon):
+    '''Method Function:
+
+        Define the lower and upper KKT bounds for the SVR intercept. With $r=y-K*beta=-grad$ (r = y−Kβ = −grad), inactive set members are represented by signed infinities so every operation retains shape (n,):
+
+        $L={r_i-epsilon:beta_i<C} union {r_i+epsilon:beta_i<0}$
+        𝓛 = {rᵢ−ε : βᵢ<C} ∪ {rᵢ+ε : βᵢ<0}
+
+        $U={r_i+epsilon:beta_i>-C} union {r_i-epsilon:beta_i>0}$
+        𝓤 = {rᵢ+ε : βᵢ>−C} ∪ {rᵢ−ε : βᵢ>0}
+
+        The violation $nu=max(L)-min(U)$ (ν = max 𝓛−min 𝓤) controls working-set selection and stopping; the final intercept is the midpoint of the two extrema
+
+    :parameters:
+        - beta (jnp.ndarray) - (n,) Compact dual variables
+        - grad (jnp.ndarray) - (n,) Unregularized dual gradient K@beta-y
+        - C (float) - Positive box-constraint bound
+        - epsilon (float) - Non-negative epsilon-insensitive width
+
+    :return:
+        - lower (jnp.ndarray) - (n,) Candidate lower intercept bounds
+        - upper (jnp.ndarray) - (n,) Candidate upper intercept bounds
+    '''
+
+    residual_without_b = -grad
+    negative_infinity = jnp.asarray(-jnp.inf,dtype=beta.dtype)
+    positive_infinity = jnp.asarray(jnp.inf,dtype=beta.dtype)
+    lower = jnp.where(beta < C,residual_without_b - epsilon,negative_infinity)
+    lower = jnp.maximum(
+        lower,jnp.where(beta < 0.0,residual_without_b + epsilon,negative_infinity)
+    )
+    upper = jnp.where(beta > -C,residual_without_b + epsilon,positive_infinity)
+    upper = jnp.minimum(
+        upper,jnp.where(beta > 0.0,residual_without_b - epsilon,positive_infinity)
+    )
+
+    return lower,upper
+
+
+
+def _solve_svr_pair(K,beta,grad,C,epsilon,i,j):
+    '''Method Function:
+
+        Solve the exact one-dimensional pair subproblem beta_i += t and beta_j -= t. Opposite updates preserve the dual equality constraint, while $t_min=max(-C-beta_i,beta_j-C)$ and $t_max=min(C-beta_i,beta_j+C)$ (t_min = max(−C−βᵢ,βⱼ−C), t_max = min(C−βᵢ,βⱼ+C)) enforce both box constraints:
+
+        $DeltaF(t)=(grad_i-grad_j)*t+0.5*a*t^2+epsilon*(|beta_i+t|-|beta_i|+|beta_j-t|-|beta_j|)$
+        ΔF(t) = (gᵢ−gⱼ)t + ½at² + ε(|βᵢ+t|−|βᵢ|+|βⱼ−t|−|βⱼ|)
+
+        $a=K_ii+K_jj-2*K_ij$ (a = Kᵢᵢ+Kⱼⱼ−2Kᵢⱼ) is the nonnegative curvature. Absolute-value knots at -beta_i and beta_j divide the feasible interval into linear-sign regions. Evaluating boundaries, clipped knots, per-interval stationary points and t=0 gives a fixed-size exact candidate set, including the zero-curvature fallback
+
+    :parameters:
+        - K (jnp.ndarray) - (n,n) Training kernel matrix
+        - beta (jnp.ndarray) - (n,) Current compact dual variables
+        - grad (jnp.ndarray) - (n,) Current unregularized dual gradient
+        - C (float) - Positive box-constraint bound
+        - epsilon (float) - Non-negative epsilon-insensitive width
+        - i (int or jax.Array) - First working-set index
+        - j (int or jax.Array) - Second working-set index
+
+    :return:
+        - step (jnp.ndarray) - Scalar optimal feasible pair-update step
+    '''
+
+    beta_i = beta[i]
+    beta_j = beta[j]
+    lower = jnp.maximum(-C - beta_i,beta_j - C)
+    upper = jnp.minimum(C - beta_i,beta_j + C)
+    curvature = K[i,i] + K[j,j] - 2.0 * K[i,j]
+    curvature = jnp.maximum(curvature,0.0)
+    linear = grad[i] - grad[j]
+
+    ### The feasible boundaries and the two absolute-value knots partition the objective
+    knots = jnp.sort(jnp.array([
+        lower,
+        upper,
+        jnp.clip(-beta_i,lower,upper),
+        jnp.clip(beta_j,lower,upper)
+    ],dtype=beta.dtype))
+    left = knots[:-1]
+    right = knots[1:]
+    middle = 0.5 * (left + right)
+    sign_i = jnp.sign(beta_i + middle)
+    sign_j = jnp.sign(beta_j - middle)
+    slope = linear + epsilon * (sign_i - sign_j)
+    safe_curvature = jnp.where(curvature > 1e-12,curvature,1.0)
+    quadratic_points = jnp.clip(-slope / safe_curvature,left,right)
+    quadratic_points = jnp.where(curvature > 1e-12,quadratic_points,left)
+    candidates = jnp.concatenate([
+        knots,quadratic_points,jnp.array([0.0],dtype=beta.dtype)
+    ])
+    objective_change = (
+        linear * candidates
+        + 0.5 * curvature * candidates ** 2
+        + epsilon * (
+            jnp.abs(beta_i + candidates) - jnp.abs(beta_i)
+            + jnp.abs(beta_j - candidates) - jnp.abs(beta_j)
+        )
+    )
+
+    return candidates[jnp.argmin(objective_change)]
+
+
+
+class _SMOSVRState(NamedTuple):
+    '''Class Introduction:
+
+        This is the fixed-shape PyTree state used by the compiled SMO while loop
+    '''
+
+    beta: jax.Array
+    grad: jax.Array
+    iteration: jax.Array
+    violation: jax.Array
+    stalled: jax.Array
+
+
+
+def _smo_svr(K,y,C,epsilon,tolerance,max_iterations):
+    '''Method Function:
+
+        Solve compact-dual SVR through second-order working-set SMO on the device. Every iteration computes $nu=max(L)-min(U)$ (ν = max 𝓛−min 𝓤), selects the maximum-violation first index and scores all eligible second indices by $descent^2/max(curvature,delta)$ (descent²/max(curvature,δ))
+
+        The exact pair step updates $beta_i <- beta_i+t$ and $beta_j <- beta_j-t$ (βᵢ ← βᵢ+t, βⱼ ← βⱼ−t), followed by $grad <- grad+t*(K[:,i]-K[:,j])$ (g ← g+t(K[:,i]−K[:,j])). A zero-step second-order candidate falls back to the maximum-violation pair. lax.while_loop stops on tolerance, the iteration budget or numerical stagnation without Python host dispatch per iteration
+
+    :parameters:
+        - K (jnp.ndarray) - (n,n) Training kernel matrix
+        - y (jnp.ndarray) - (n,) Standardized training targets
+        - C (float) - Positive box-constraint bound
+        - epsilon (float) - Non-negative epsilon-insensitive width
+        - tolerance (float) - Positive KKT convergence tolerance
+        - max_iterations (int) - Positive maximum number of pair updates
+
+    :return:
+        - state (_SMOSVRState) - Final dual, gradient and convergence state
+        - intercept (jnp.ndarray) - Intercept in the standardized target space
+    '''
+
+    n = y.shape[0]
+    diagonal = jnp.diag(K)
+    indices = jnp.arange(n)
+
+    def bounds_and_violation(beta,grad):
+        '''Method Function:
+
+            Evaluate both KKT intercept bounds and their scalar maximum-violation residual for the current dual state
+        '''
+
+        lower,upper = _svr_kkt_bounds(beta,grad,C,epsilon)
+        violation = jnp.max(lower) - jnp.min(upper)
+        return lower,upper,violation
+
+    initial_state = _SMOSVRState(
+        beta=jnp.zeros(n,dtype=jnp.float64),
+        grad=-y,
+        iteration=jnp.array(0,dtype=jnp.int32),
+        violation=jnp.array(jnp.inf,dtype=jnp.float64),
+        stalled=jnp.array(False)
+    )
+
+    def condition(state):
+        '''Method Function:
+
+            Continue the device-side loop only while iterations remain, KKT violation exceeds tolerance and no stagnation is flagged
+        '''
+
+        return (
+            (state.iteration < max_iterations)
+            & (state.violation > tolerance)
+            & ~state.stalled
+        )
+
+    def body(state):
+        '''Method Function:
+
+            Execute one second-order working-set selection, exact pair update and O(n) gradient correction with immutable state
+        '''
+
+        beta = state.beta
+        grad = state.grad
+        lower,upper,violation = bounds_and_violation(beta,grad)
+        i = jnp.argmax(lower)
+        j_mvp = jnp.argmin(upper)
+
+        ### Score every feasible second variable against the maximum-violation first variable
+        curvature = diagonal[i] + diagonal - 2.0 * K[i,:]
+        curvature = jnp.maximum(curvature,0.0)
+        derivative_plus_i = jnp.where(beta[i] >= 0.0,1.0,-1.0)
+        derivative_minus = jnp.where(beta <= 0.0,1.0,-1.0)
+        directional = (
+            grad[i] - grad + epsilon * (derivative_plus_i - derivative_minus)
+        )
+        step_lower = jnp.maximum(-C - beta[i],beta - C)
+        step_upper = jnp.minimum(C - beta[i],beta + C)
+        descent = jnp.maximum(
+            jnp.where(step_upper > 1e-14,-directional,0.0),
+            jnp.where(step_lower < -1e-14,directional,0.0)
+        )
+        eligible = upper < lower[i] - 0.5 * violation
+        score = jnp.where(
+            (descent > 0.0) & (indices != i) & eligible,
+            descent ** 2 / jnp.maximum(curvature,1e-12),
+            -jnp.inf
+        )
+        j_second_order = jnp.argmax(score)
+        j = jnp.where(jnp.isfinite(score[j_second_order]),j_second_order,j_mvp)
+        step = _solve_svr_pair(K,beta,grad,C,epsilon,i,j)
+
+        ### Fall back to the maximum-violation pair when the second-order candidate stalls
+        use_fallback = jnp.abs(step) < 1e-14
+        fallback_step = _solve_svr_pair(K,beta,grad,C,epsilon,i,j_mvp)
+        j = jnp.where(use_fallback,j_mvp,j)
+        step = jnp.where(use_fallback,fallback_step,step)
+
+        ### Opposite updates preserve the equality constraint; two kernel columns update grad in O(n)
+        beta = beta.at[i].add(step).at[j].add(-step)
+        grad = grad + step * (K[:,i] - K[:,j])
+        _,_,new_violation = bounds_and_violation(beta,grad)
+
+        return _SMOSVRState(
+            beta=beta,
+            grad=grad,
+            iteration=state.iteration + 1,
+            violation=new_violation,
+            stalled=jnp.abs(step) < 1e-15
+        )
+
+    state = lax.while_loop(condition,body,initial_state)
+    lower,upper = _svr_kkt_bounds(state.beta,state.grad,C,epsilon)
+    intercept = 0.5 * (jnp.max(lower) + jnp.min(upper))
+
+    return state,intercept
+
+
+
+def _fit_smo_svr(X,y,C,epsilon,gamma,tolerance,max_iterations,support_tolerance):
+    '''Method Function:
+
+        Train RBF SVR and retain only the support vectors required for inference. Training-only preprocessing computes $X_s=(X-mu_X)/sigma_X$ and $y_s=(y-mu_y)/sigma_y$ (Xₛ = (X−μₓ)/σₓ, yₛ = (y−μ_y)/σ_y), with positive fallbacks for near-zero scales. Consequently, epsilon and tolerance are measured in standardized target units
+
+        One n×n RBF matrix is passed to a JIT closure whose hyperparameters and iteration budget are static. After solving, the full beta is retained for diagnostics while $S={i:|beta_i|>support_tolerance}$ (𝒮 = {i : |βᵢ| > support_tolerance}) determines the standardized support vectors and dual_coef used by reasoning. metrics also compares the incrementally maintained gradient with K@beta-y_s and reports the equality residual, KKT violation and honest convergence state
+
+    :parameters:
+        - X (jnp.ndarray) - (n,p) Validated training features
+        - y (jnp.ndarray) - (n,) Validated training targets
+        - C (float) - Positive box-constraint bound
+        - epsilon (float) - Non-negative epsilon-insensitive width
+        - gamma (float) - Positive RBF kernel scale
+        - tolerance (float) - Positive KKT convergence tolerance
+        - max_iterations (int) - Positive maximum number of pair updates
+        - support_tolerance (float) - Non-negative support-vector pruning threshold
+
+    :return:
+        - result (dict) - Complete dual variables, sparse inference state and diagnostics
+    '''
+
+    x_mean = jnp.mean(X,axis=0)
+    x_scale = jnp.maximum(jnp.std(X,axis=0),1e-12)
+    y_mean = jnp.mean(y)
+    y_scale = jnp.maximum(jnp.std(y),1e-12)
+    X_standardized = (X - x_mean) / x_scale
+    y_standardized = (y - y_mean) / y_scale
+    K = _svr_rbf_kernel(X_standardized,X_standardized,gamma)
+
+    ### Hyperparameters and the iteration limit are static closure values for compilation
+    solve = jax.jit(
+        lambda kernel,target: _smo_svr(
+            kernel,target,C,epsilon,tolerance,max_iterations
+        )
+    )
+    state,intercept = solve(K,y_standardized)
+    if (
+        not bool(jnp.all(jnp.isfinite(state.beta)))
+        or not bool(jnp.all(jnp.isfinite(state.grad)))
+        or not bool(jnp.isfinite(intercept))
+        or not bool(jnp.isfinite(state.violation))
+    ):
+        raise RuntimeError("SVR optimization produced non-finite parameters or diagnostics")
+
+    beta_values = np.asarray(state.beta)
+    support_mask = np.abs(beta_values) > support_tolerance
+    support_indices = np.flatnonzero(support_mask)
+    gradient_error = float(jnp.linalg.norm(
+        state.grad - (K @ state.beta - y_standardized),ord=jnp.inf
+    ))
+    metrics = {
+        "n_iter": int(state.iteration),
+        "kkt_violation": float(state.violation),
+        "stalled": bool(state.stalled),
+        "converged": bool(state.violation <= tolerance),
+        "equality_residual": float(np.sum(beta_values)),
+        "gradient_error": gradient_error,
+        "kernel_shape": tuple(K.shape),
+        "n_support": int(support_indices.size),
+        "C": C,
+        "epsilon": epsilon,
+        "gamma": gamma,
+        "tolerance": tolerance,
+        "max_iterations": max_iterations,
+        "support_tolerance": support_tolerance
+    }
+
+    return {
+        "beta_hat": state.beta,
+        "support_vectors": X_standardized[support_mask],
+        "dual_coef": state.beta[support_mask],
+        "support_indices": jnp.asarray(support_indices,dtype=jnp.int32),
+        "intercept": intercept,
+        "x_mean": x_mean,
+        "x_scale": x_scale,
+        "y_mean": y_mean,
+        "y_scale": y_scale,
+        "metrics": metrics
+    }
+
+
+
+@jax.jit
+def _predict_smo_svr(A_test,support_vectors,dual_coef,intercept,x_mean,x_scale,y_mean,y_scale,gamma):
+    '''Method Function:
+
+        Define JIT-compiled sparse kernel inference with target inverse standardization. Test features reuse the training mean and scale; no test statistic is estimated. With $K_test in R^(m*s)$ (K_test ∈ R^(m×s)), the two-stage prediction is:
+
+        $f_s=K_test@dual_coef+intercept$
+        fₛ = K_test·dual_coef + b
+
+        $y_pred=y_mean+y_scale*f_s$
+        ŷ = μ_y + σ_y fₛ
+
+        When s=0, the empty matrix product contributes zeros and the result is the constant target model. No training-kernel allocation or SMO iteration is repeated during inference
+
+    :parameters:
+        - A_test (jnp.ndarray) - (m,p) Test feature matrix
+        - support_vectors (jnp.ndarray) - (s,p) Standardized support vectors
+        - dual_coef (jnp.ndarray) - (s,) Non-zero compact dual coefficients
+        - intercept (jnp.ndarray) - Intercept in the standardized target space
+        - x_mean (jnp.ndarray) - (p,) Training feature means
+        - x_scale (jnp.ndarray) - (p,) Training feature scales
+        - y_mean (jnp.ndarray) - Scalar training target mean
+        - y_scale (jnp.ndarray) - Scalar training target scale
+        - gamma (float) - Positive RBF kernel scale
+
+    :return:
+        - y_pred (jnp.ndarray) - (m,) Predictions in the original target space
+    '''
+
+    X_standardized = (A_test - x_mean) / x_scale
+    K_test = _svr_rbf_kernel(X_standardized,support_vectors,gamma)
+    standardized_prediction = K_test @ dual_coef + intercept
+
+    return y_mean + y_scale * standardized_prediction
+
+
+
+class SMOSVRComponent(BaseRegression):
+    '''Class Introduction:
+
+        This is an RBF support vector regression component based on compact-dual second-order sequential minimal optimization (SMO), exact pair subproblems and a JIT-compiled lax.while_loop. It solves the original epsilon-insensitive kernel SVR rather than a kernel approximation. The component is intended for small and medium dense data whose precomputed kernel matrix fits in memory, teaching, algorithm verification and reproducible numerical reference workflows
+
+    Mathematical principle
+    ----------------------
+    (1) Primal epsilon-SVR: given n samples $D={(x_i,y_i)}$ (𝒟 = {(xᵢ,yᵢ)}), $x_i in R^p$ (xᵢ ∈ Rᵖ) and $y_i in R$ (yᵢ ∈ R), a feature map $phi(x)$ (φ(x)) and an intercept b, the primal optimization problem is:
+
+        $min_{w,b,xi,xi^*} 0.5*||w||_2^2 + C*sum_i(xi_i+xi_i^*)$
+        min ½‖w‖₂² + CΣᵢ(ξᵢ+ξᵢ*), subject to:
+
+        $y_i-(w^T*phi(x_i)+b) <= epsilon+xi_i$
+        yᵢ − (wᵀφ(xᵢ)+b) ≤ ε+ξᵢ
+
+        $(w^T*phi(x_i)+b)-y_i <= epsilon+xi_i^*$
+        (wᵀφ(xᵢ)+b) − yᵢ ≤ ε+ξᵢ*
+
+        $xi_i >= 0 , xi_i^* >= 0$
+        ξᵢ ≥ 0, ξᵢ* ≥ 0
+
+        C>0 controls the trade-off between function complexity and violations outside the epsilon-insensitive tube. epsilon>=0 defines the tube width. Inside the tube, deviations do not contribute to the loss; outside it, slack variables measure the excess
+
+    (2) Compact dual representation: the standard dual maintains alpha and alpha* in [0,C]^n. At an optimum, both variables for one observation need not be positive simultaneously, so this component uses:
+
+        $beta=alpha-alpha^* , alpha+alpha^*=|beta|$
+        β = α−α*, α+α* = |β|
+
+        With $K_ij=k(x_i,x_j)$ (Kᵢⱼ = k(xᵢ,xⱼ)), the equivalent compact dual is:
+
+        $min_beta F(beta)=0.5*beta^T*K*beta + epsilon*||beta||_1-y^T*beta$
+        min F(β) = ½βᵀKβ + ε‖β‖₁ − yᵀβ
+
+        $1^T*beta=0 , -C <= beta_i <= C$
+        1ᵀβ = 0, −C ≤ βᵢ ≤ C
+
+        This reduces the state from 2n variables to n, avoids a full 2n×2n block Q matrix and makes beta the direct coefficient vector of the kernel expansion. The y supplied to this optimization is the standardized target, so epsilon and tolerance are interpreted in that space
+
+    (3) Training-only standardization and RBF kernel: features and targets are standardized using training statistics only:
+
+        $X_s=(X-mu_X)/sigma_X , y_s=(y-mu_y)/sigma_y$
+        Xₛ = (X−μₓ)/σₓ, yₛ = (y−μ_y)/σ_y
+
+        Near-zero scales receive a positive numerical fallback. Test data never participates in estimating these values. The RBF kernel is:
+
+        $K_ij=exp(-gamma*||x_i-x_j||_2^2) , gamma>0$
+        Kᵢⱼ = exp(−γ‖xᵢ−xⱼ‖₂²), γ > 0
+
+        Squared distances are evaluated with $||x-z||^2=||x||^2+||z||^2-2*x^T*z$ (‖x−z‖² = ‖x‖²+‖z‖²−2xᵀz). Small negative values caused by round-off are clipped to zero before exponentiation. Only one n×n training kernel is stored
+
+    (4) Pair updates preserve the equality constraint: each SMO iteration chooses two indices i,j and updates:
+
+        $beta_i <- beta_i+t , beta_j <- beta_j-t$
+        βᵢ ← βᵢ+t, βⱼ ← βⱼ−t
+
+        Starting from beta=0, every update preserves $sum_k beta_k=0$ (Σₖβₖ = 0). The feasible interval is:
+
+        $t_min=max(-C-beta_i,beta_j-C) , t_max=min(C-beta_i,beta_j+C)$
+        t_min = max(−C−βᵢ, βⱼ−C), t_max = min(C−βᵢ, βⱼ+C)
+
+        Define the unregularized gradient $g=K*beta-y$ (g = Kβ−y) and curvature $a=K_ii+K_jj-2*K_ij$ (a = Kᵢᵢ+Kⱼⱼ−2Kᵢⱼ). Along the pair direction, the exact objective change is:
+
+        $DeltaF(t)=(g_i-g_j)*t+0.5*a*t^2+epsilon*(|beta_i+t|-|beta_i|+|beta_j-t|-|beta_j|)$
+        ΔF(t) = (gᵢ−gⱼ)t + ½at² + ε(|βᵢ+t|−|βᵢ|+|βⱼ−t|−|βⱼ|)
+
+        The L1 terms make this a piecewise one-dimensional quadratic function. Its knots are t=-beta_i and t=beta_j. The solver checks both boundaries, both clipped knots, the stationary point in every linear interval and the current point t=0, then selects the candidate with the smallest objective change. Near-zero curvature is handled without an unsafe division
+
+    (5) Working-set selection and O(n) gradient update: the first index is the maximum KKT violator. For every candidate second index, the implementation computes a feasible directional derivative, curvature and approximate descent benefit:
+
+        $score=descent^2/max(curvature,delta)$
+        score = descent²/max(curvature,δ)
+
+        Only candidates that still form a significant violation with the first index are eligible. If the second-order choice produces no effective step, the solver falls back to the maximum-violation pair. After accepting t, the gradient is updated as:
+
+        $g <- g+t*(K[:,i]-K[:,j])$
+        g ← g + t(K[:,i]−K[:,j])
+
+        This is O(n), avoiding a fresh O(n²) K@beta multiplication on every iteration. Unit tests independently recompute K@beta-y to detect accumulated update errors
+
+    (6) KKT bounds, stopping and intercept: define the residual without the intercept as $r=y-K*beta=-g$ (r = y−Kβ = −g). Candidate lower and upper intercept sets are:
+
+        $L={r_i-epsilon:beta_i<C} union {r_i+epsilon:beta_i<0}$
+        𝓛 = {rᵢ−ε : βᵢ<C} ∪ {rᵢ+ε : βᵢ<0}
+
+        $U={r_i+epsilon:beta_i>-C} union {r_i-epsilon:beta_i>0}$
+        𝓤 = {rᵢ+ε : βᵢ>−C} ∪ {rᵢ−ε : βᵢ>0}
+
+        At exact optimality, $max(L)<=b<=min(U)$ (max 𝓛 ≤ b ≤ min 𝓤). The stopping residual is:
+
+        $nu=max(L)-min(U)$
+        ν = max 𝓛 − min 𝓤
+
+        Iteration stops when nu<=tolerance, the update budget is reached or a numerically stalled step is detected. The returned intercept is $b=0.5*(max(L)+min(U))$ (b = ½(max 𝓛+min 𝓤)). At positive tolerance, this midpoint can differ from either bound by approximately half the remaining interval; reaching max_iterations is never relabelled as convergence
+
+    (7) Support vectors and prediction: observations with nonzero beta are the support vectors. The component applies the configured threshold:
+
+        $S={i:|beta_i|>support_tolerance}$
+        𝒮 = {i : |βᵢ| > support_tolerance}
+
+        Only standardized support vectors and their nonzero coefficients are retained for inference. For m test samples and s support vectors, $K_test in R^(m*s)$ (K_test ∈ R^(m×s)) gives:
+
+        $f_s(x)=sum_(i in S) beta_i*k(x_i,x)+b$
+        f_s(x) = Σᵢ∈𝒮βᵢk(xᵢ,x)+b
+
+        $y_pred=mu_y+sigma_y*f_s(x)$
+        ŷ = μ_y + σ_y f_s(x)
+
+        With no support vectors, the matrix product is zero and prediction reduces to the constant target model. Pruning small nonzero coefficients can introduce a small approximation; support_tolerance=0 retains every nonzero coefficient
+
+    (8) Why precomputed-K second-order SMO: the implementation chooses exactness, fixed shapes and transparent numerical checks rather than universal scalability:
+
+        ============================  ============================================  ==========================================
+        Method                        Main property                                 Typical scenario
+        ============================  ============================================  ==========================================
+        Full-matrix interior point     Standard convex-QP formulation               Small teaching and benchmark problems
+        LIBSVM dynamic-cache SMO       Mature exact solver with configurable cache General exact kernel regression
+        Python loop + JAX operations   Simple prototype                            Debugging, with host scheduling overhead
+        Precomputed K + JIT SMO        Exact dual, fixed shapes, device-side loop   This small/medium dense implementation
+        Nystrom / RFF + linear SVR     Lower memory and higher matrix parallelism   Large-scale approximate kernel regression
+        ============================  ============================================  ==========================================
+
+        Precomputing K costs O(n^2) memory. Work-set selection and gradient updates are primarily O(n) per iteration, but the number of serial iterations is data and tolerance dependent
+
+    Algorithm flow
+    --------------
+    .. code-block:: text
+
+        Input A(n×p), b(n,), C, epsilon, gamma and solver controls
+            |
+            v
+        Validate shapes, finite values and hyperparameters
+            |
+            v
+        Training-only X/y standardization -> precompute RBF K(n,n)
+            |
+            v
+        Initialize beta=0, grad=-y_s, iteration=0, stalled=False
+            |
+            v
+        KKT lower/upper bounds -> violation nu=max(L)-min(U)
+            |
+            +------------> Stop when converged, stalled or at max_iterations
+            |
+            v
+        Maximum-violation first index -> second-order second-index score
+            |
+            v
+        Exact pair subproblem: boundaries + knots + stationary points + t=0
+            |
+            +------------> Fall back to maximum-violation pair if necessary
+            |
+            v
+        beta_i += t, beta_j -= t -> grad += t*(K[:,i]-K[:,j])
+            |
+            v
+        Recover intercept from KKT midpoint -> extract support vectors
+            |
+            v
+        Inference: training preprocessing -> K_test(m,s) -> kernel expansion
+            |
+            v
+        Inverse target standardization -> y_pred(m,) in original target space
+
+    Step 1 (validation): require a finite two-dimensional A, a finite one-dimensional b, matching sample counts, at least two observations and at least one feature. Validate all hyperparameters before compiling numerical functions
+
+    Step 2 (preprocessing and kernel): estimate X/y means and scales from training data only, standardize both, construct one RBF kernel and never construct the larger 2n×2n block dual matrix
+
+    Step 3 (initialization): initialize beta=0 and grad=-y_s. The zero vector satisfies both the equality and box constraints, and the initial KKT violation is infinite so the compiled loop evaluates its first state consistently
+
+    Step 4 (working-set selection): calculate KKT bounds and select the maximum-violation pair. Use the second-order score to seek a larger productive step and retain the maximum-violation fallback
+
+    Step 5 (exact pair update): enumerate the complete fixed-size candidate set for the piecewise-quadratic objective. Opposite updates preserve the equality constraint and the feasible interval enforces both box constraints
+
+    Step 6 (state update and stopping): update grad from two kernel columns, recalculate the KKT violation and use lax.while_loop conditions for tolerance, iteration limit and numerical stagnation. No Python host loop is placed around individual SMO iterations
+
+    Step 7 (model restoration): calculate the intercept from the final KKT bounds, expose the complete beta_hat for diagnostics and retain only support vectors and coefficients required by reasoning
+
+    Step 8 (inference and verification): standardize test features with training statistics, evaluate the sparse kernel expansion and inverse-standardize the target. Tests check independent kernel values, pair search, KKT, equality/box constraints, gradient consistency, pruning and nonlinear prediction
+
+    JAX unique advantages
+    ---------------------
+    (1) Fully compiled SMO control flow: KKT evaluation, working-set selection, exact pair solving, immutable updates and stopping all execute inside one jax.jit-compiled lax.while_loop. This avoids Python scheduling and host synchronization on every pair update
+
+    (2) Fixed-shape functional state: _SMOSVRState is a NamedTuple PyTree with stable array shapes and dtypes. JAX arrays use .at[index].add(...) rather than in-place mutation, making data dependencies explicit and XLA-compatible
+
+    (3) Vectorized matrix kernels: pairwise distances use matrix multiplication and broadcasting. Work-set scores are evaluated for all candidate indices simultaneously, and inference constructs only the m×s support-vector kernel
+
+    (4) Reproducible numerical checks: explicit PRNGKey values generate reference data. Identical inputs and parameters reproduce results in the reference environment, while KKT, equality, box and gradient residuals provide stronger checks than RMSE alone
+
+    (5) Backend migration with explicit limits: the same array program can target supported JAX backends. SMO remains a serial active-set iteration, however, so GPU execution is not automatically faster than CPU execution. Cross-backend bitwise identity is not promised
+
+    (6) Composable inference, cautious differentiation claims: support vectors, coefficients and preprocessing arrays are ordinary JAX values suitable for custom inference pipelines. This does not imply that differentiating through data-dependent SMO index selection and while-loop trip counts is a supported training strategy
+
+    Precautions
+    -----------
+    (1) This is exact kernel SVR, not Nystrom or random-feature approximation. Replacing the RBF kernel requires a valid symmetric positive-semidefinite kernel and renewed numerical testing
+
+    (2) Kernel memory is a hard constraint. In float64, n=10000 requires about 800 MB for K alone, before temporary arrays and backend workspaces. Use an approximate or linear solver when K cannot fit in memory
+
+    (3) epsilon and tolerance live in standardized target space. Changing y_scale changes their original-space meaning. Predictions must always apply the stored inverse transformation
+
+    (4) Maximum iterations is not convergence. Inspect converged, kkt_violation, stalled and n_iter. A finite parameter vector alone is not evidence of an acceptable optimum
+
+    (5) Numerical stagnation can result from very small tolerances, ill-conditioned kernels, unusual scales or floating-point limits. Increasing max_iterations alone does not address stagnation
+
+    (6) Support-vector pruning is approximate when support_tolerance>0. Compare full and sparse predictions for sensitive applications; use support_tolerance=0 to retain all nonzero coefficients
+
+    (7) Constant targets and duplicate samples are supported numerically, but a finite result need not imply a statistically useful model. Empty support sets intentionally produce a constant prediction
+
+    (8) Keep shapes static inside compiled code. Dynamic shrinking, dynamic LRU caches and Python sample loops would change the compilation model and are deliberately outside this implementation
+
+    (9) The complete beta_hat is in standardized target space and is not a primal linear coefficient vector. dual_coef is only its retained nonzero subset, and support_vectors are standardized features
+
+    (10) Cross-version and cross-backend floating-point results can differ slightly, including iteration counts near working-set ties. Validate with KKT and prediction tolerances rather than exact historical scalars
+
+    (11) Model selection and production management are outside scope: cross-validation, gamma/C/epsilon tuning, sample weights, robust scaling, serialization and monitoring require an application layer
+
+    (12) Accuracy or RMSE is not a sufficient correctness proof. Retain independent kernel, exact-pair, KKT, equality, box, gradient and support-pruning tests
+
+    :example:
+        >>> import jax
+        >>> import jax.numpy as jnp
+        >>> from statjax.regression import SMOSVRComponent
+        >>> # Generate reproducible nonlinear regression data
+        >>> key = jax.random.PRNGKey(42)
+        >>> A = jnp.linspace(-3.0,3.0,40,dtype=jnp.float64)[:,None]
+        >>> b = jnp.sin(A[:,0]) + 0.05*jax.random.normal(key,(40,),dtype=jnp.float64)
+        >>> # Train the exact RBF dual and perform sparse continuous inference
+        >>> svr_instance = SMOSVRComponent(C=10.0,epsilon=0.05,gamma=0.5)
+        >>> beta_hat,metrics = svr_instance.train(A=A,b=b)
+        >>> y_pred = svr_instance.reasoning(A_test=A[:10])
+        >>> support_vectors = svr_instance.support_vectors
+        >>> dual_coef = svr_instance.dual_coef
+        >>> converged = metrics["converged"]
+
+    :reference:
+        - [Support vector regression](https://en.wikipedia.org/wiki/Support_vector_machine#Regression)
+        - [Sequential minimal optimization](https://en.wikipedia.org/wiki/Sequential_minimal_optimization)
+        - [Radial basis function kernel](https://en.wikipedia.org/wiki/Radial_basis_function_kernel)
+        - [Karush-Kuhn-Tucker conditions](https://en.wikipedia.org/wiki/Karush%E2%80%93Kuhn%E2%80%93Tucker_conditions)
+        - StatJAX008 Support Vector Regression Design Document `"StatJAX008 SVM SH V001"<https://github.com/redblue0216/statjax>`_
+    '''
+
+    def __init__(self,C=10.0,epsilon=0.05,gamma=0.5,tolerance=1e-4,max_iterations=20000,support_tolerance=1e-7):
+        '''Attribute Function:
+
+            Initialize RBF SVR hyperparameters and the untrained model state
+
+        :parameters:
+            - C (float) - Positive box-constraint bound
+            - epsilon (float) - Non-negative epsilon-insensitive width in standardized target space
+            - gamma (float) - Positive RBF kernel scale
+            - tolerance (float) - Positive KKT tolerance in standardized target space
+            - max_iterations (int) - Positive maximum number of pair updates
+            - support_tolerance (float) - Non-negative support-vector pruning threshold
+        '''
+
+        parameters = {
+            "C": (C,False),
+            "epsilon": (epsilon,True),
+            "gamma": (gamma,False),
+            "tolerance": (tolerance,False),
+            "support_tolerance": (support_tolerance,True)
+        }
+        validated = {}
+        for name,(value,allow_zero) in parameters.items():
+            if (
+                isinstance(value,(bool,np.bool_))
+                or not isinstance(value,(int,float,np.integer,np.floating))
+            ):
+                raise ValueError(f"{name} must be a finite real number")
+            value = float(value)
+            valid_range = value >= 0.0 if allow_zero else value > 0.0
+            if not np.isfinite(value) or not valid_range:
+                comparison = "non-negative" if allow_zero else "positive"
+                raise ValueError(f"{name} must be finite and {comparison}")
+            validated[name] = value
+        if (
+            not isinstance(max_iterations,int)
+            or isinstance(max_iterations,(bool,np.bool_))
+            or max_iterations < 1
+        ):
+            raise ValueError("max_iterations must be a positive integer")
+
+        self.C = validated["C"]
+        self.epsilon = validated["epsilon"]
+        self.gamma = validated["gamma"]
+        self.tolerance = validated["tolerance"]
+        self.max_iterations = max_iterations
+        self.support_tolerance = validated["support_tolerance"]
+        self.beta_hat = None
+        self.support_vectors = None
+        self.dual_coef = None
+        self.support_indices = None
+        self.intercept = None
+        self.x_mean = None
+        self.x_scale = None
+        self.y_mean = None
+        self.y_scale = None
+        self.metrics = None
+
+
+    def train(self,A,b):
+        '''Method Function:
+
+            Train RBF SVR through standardized compact-dual second-order SMO
+
+        :parameters:
+            - A (jnp.ndarray) - (n,p) Training feature matrix
+            - b (jnp.ndarray) - (n,) Continuous training targets
+
+        :return:
+            - beta_hat (jnp.ndarray) - (n,) Complete compact dual variables in standardized target space
+            - metrics (dict) - KKT, equality, gradient, support-vector and convergence diagnostics
+        '''
+
+        A = jnp.asarray(A,dtype=jnp.float64)
+        b = jnp.asarray(b,dtype=jnp.float64)
+        if A.ndim != 2 or b.ndim != 1 or A.shape[0] != b.shape[0]:
+            raise ValueError("A must have shape (n,p), b must have shape (n,), and their sample counts must match")
+        if A.shape[0] < 2 or A.shape[1] == 0:
+            raise ValueError("A and b must contain at least two samples and A must contain at least one feature")
+        if not bool(jnp.all(jnp.isfinite(A))) or not bool(jnp.all(jnp.isfinite(b))):
+            raise ValueError("A and b must contain only finite values")
+
+        result = _fit_smo_svr(
+            A,b,self.C,self.epsilon,self.gamma,self.tolerance,
+            self.max_iterations,self.support_tolerance
+        )
+        self.beta_hat = result["beta_hat"]
+        self.support_vectors = result["support_vectors"]
+        self.dual_coef = result["dual_coef"]
+        self.support_indices = result["support_indices"]
+        self.intercept = result["intercept"]
+        self.x_mean = result["x_mean"]
+        self.x_scale = result["x_scale"]
+        self.y_mean = result["y_mean"]
+        self.y_scale = result["y_scale"]
+        self.metrics = result["metrics"]
+
+        return self.beta_hat,self.metrics
+
+
+    def reasoning(self,A_test):
+        '''Method Function:
+
+            Predict continuous targets using the trained sparse RBF kernel expansion
+
+        :parameters:
+            - A_test (jnp.ndarray) - (m,p) Test feature matrix with the training feature dimension
+
+        :return:
+            - y_pred (jnp.ndarray) - (m,) Float64 predictions in the original target space
+        '''
+
+        if self.beta_hat is None:
+            raise RuntimeError("SMOSVRComponent has not been trained yet, please call the train method first")
+        A_test = jnp.asarray(A_test,dtype=jnp.float64)
+        if A_test.ndim != 2 or A_test.shape[1] != self.x_mean.shape[0]:
+            raise ValueError("A_test must have shape (m,p) with the same feature dimension as training data")
+        if A_test.shape[0] == 0:
+            raise ValueError("A_test must be non-empty")
+        if not bool(jnp.all(jnp.isfinite(A_test))):
+            raise ValueError("A_test must contain only finite values")
+
+        return _predict_smo_svr(
+            A_test,self.support_vectors,self.dual_coef,self.intercept,
+            self.x_mean,self.x_scale,self.y_mean,self.y_scale,self.gamma
+        )
+
+
+    def _info(self):
+        '''Method Function:
+
+            Return component metadata
+
+        :parameters:
+            nothing
+
+        :return:
+            - info (str) - Text introduction of the component
+        '''
+
+        return "SMOSVRComponent: RBF support vector regression component based on compact-dual second-order SMO and exact pair subproblems, implemented with the JAX technology stack"
 
 
 

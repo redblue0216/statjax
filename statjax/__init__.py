@@ -88,7 +88,7 @@ Usage examples
 .. code-block:: python
     :linenos:
 
-    from statjax.regression import HouseholderOLSComponent,QRLogisticComponent,QRProbitComponent,QRMultinomialLogisticComponent,GHKMultinomialProbitComponent
+    from statjax.regression import HouseholderOLSComponent,QRLogisticComponent,QRProbitComponent,QRMultinomialLogisticComponent,GHKMultinomialProbitComponent,SMOSVRComponent
 
     ### Train the OLS model and solve the optimal regression coefficients
     ols_instance = HouseholderOLSComponent()
@@ -122,12 +122,19 @@ Usage examples
     probabilities = mnp_instance.predict_proba(A_test=A_mnp_test)
     y_pred = mnp_instance.reasoning(A_test=A_mnp_test)
 
+    ### Support vector regression preserves the unified component interface
+    svr_instance = SMOSVRComponent(C=10.0,epsilon=0.05,gamma=0.5)
+    beta_hat,metrics = svr_instance.train(A=A_svr_train,b=b_svr_train)
+    y_pred = svr_instance.reasoning(A_test=A_svr_test)
+
 Class Description
 -----------------
 
 References
 ----------
 StatJAX Design Document `"StatJAX Design SH V001"<https://github.com/redblue0216/statjax>`_
+
+StatJAX008 Support Vector Regression Design Document `"StatJAX008 SVM SH V001"<https://github.com/redblue0216/statjax>`_
 '''
 
 
@@ -159,13 +166,13 @@ def _read_version() -> str:
         text = pyproject.read_text(encoding='utf-8')
         import re as _re
         m = _re.search(r'^version\s*=\s*"([^"]+)"', text, _re.M)
-        return m.group(1) if m else '0.7.1'
+        return m.group(1) if m else '0.8.1'
     except Exception:
         pass
     try:
         return _im.version('statjax')
     except Exception:
-        return '0.7.1'
+        return '0.8.1'
 
 
 

@@ -58,7 +58,7 @@ python build.py --clean --install
 import jax
 import jax.numpy as jnp
 from jax.scipy.stats import norm
-from statjax.regression import HouseholderOLSComponent, SVDRidgeComponent, CDLassoComponent, QRLogisticComponent, QRProbitComponent, QRMultinomialLogisticComponent, GHKMultinomialProbitComponent
+from statjax.regression import HouseholderOLSComponent, SVDRidgeComponent, CDLassoComponent, QRLogisticComponent, QRProbitComponent, QRMultinomialLogisticComponent, GHKMultinomialProbitComponent, SMOSVRComponent
 
 # Prepare the training data (column full rank design matrix A and observation labels b)
 A_train = jax.random.normal(jax.random.PRNGKey(0), (100, 5))
@@ -126,6 +126,13 @@ mnp = GHKMultinomialProbitComponent(num_draws=128)
 mnp_theta, metrics = mnp.train(A=A_mnp, b=mnp_labels)
 probabilities = mnp.predict_proba(A_test=A_mnp)  # (n, 3), independent inference draws
 class_pred = mnp.reasoning(A_test=A_mnp)         # int32 argmax labels
+
+# Train exact RBF support vector regression with a fully compiled SMO loop
+A_svr = jnp.linspace(-3.0, 3.0, 40, dtype=jnp.float64)[:, None]
+b_svr = jnp.sin(A_svr[:, 0])
+svr = SMOSVRComponent(C=10.0, epsilon=0.05, gamma=0.5)
+svr_beta, metrics = svr.train(A=A_svr, b=b_svr)  # complete compact dual, (40,)
+y_pred = svr.reasoning(A_test=A_svr)             # original target scale, (40,)
 ```
 
 Runnable end-to-end demos:
@@ -138,6 +145,7 @@ python example/example_004.py   # Binary Logistic regression (IRLS + pivoted QR)
 python example/example_005.py   # Binary Probit regression (Fisher scoring + pivoted QR)
 python example/example_006.py   # Multinomial Logistic regression (whitened IRLS + handwritten pivoted QR)
 python example/example_007.py   # Multinomial Probit regression (Cholesky + GHK + MSL + BFGS)
+python example/example_008.py   # RBF support vector regression (second-order SMO)
 ```
 
 Run unit tests:
@@ -147,11 +155,11 @@ pip install pytest
 python -m pytest -v
 ```
 
-For the complete self-test process from scratch, see [StatJAX自我测试完整流程_SH_V007.md](design/StatJAX自我测试完整流程_SH_V007.md).
+For the complete self-test process from scratch, see [StatJAX自我测试完整流程_SH_V008.md](design/StatJAX自我测试完整流程_SH_V008.md).
 
 ### 3.3 design
 <details>
-<summary>Click to view design documents (21 files)</summary>
+<summary>Click to view design documents (24 files)</summary>
 
 | File | Description |
 |:----|:----|
@@ -170,12 +178,15 @@ For the complete self-test process from scratch, see [StatJAX自我测试完整�
 | [StatJAX006_多分类logistic_SH_V001.md](design/StatJAX006_多分类logistic_SH_V001.md) | Multinomial Logistic algorithm document: reference-category Softmax, whitened IRLS, handwritten pivoted QR and Armijo backtracking |
 | [StatJAX007_实施方案_SH_V001.md](design/StatJAX007_实施方案_SH_V001.md) | Implementation plan for the StatJAX007 iteration |
 | [StatJAX007_多分类probit_SH_V001.md](design/StatJAX007_多分类probit_SH_V001.md) | Multinomial Probit algorithm document: scale-constrained Cholesky, GHK, fixed-draw MSL and automatic-differentiation BFGS |
+| [StatJAX008_实施方案_SH_V001.md](design/StatJAX008_实施方案_SH_V001.md) | Implementation plan for the StatJAX008 iteration |
+| [StatJAX008_SVM_SH_V001.md](design/StatJAX008_SVM_SH_V001.md) | Support vector regression algorithm document: RBF kernels, compact duals, second-order SMO and fully compiled device-side iteration |
 | [StatJAX自我测试完整流程_SH_V002.md](design/StatJAX自我测试完整流程_SH_V002.md) | Complete self-test process of StatJAX from scratch (for statjax 0.2.1) |
 | [StatJAX自我测试完整流程_SH_V003.md](design/StatJAX自我测试完整流程_SH_V003.md) | Complete self-test process of StatJAX from scratch (for statjax 0.3.1) |
 | [StatJAX自我测试完整流程_SH_V004.md](design/StatJAX自我测试完整流程_SH_V004.md) | Complete self-test process of StatJAX from scratch (for statjax 0.4.1) |
 | [StatJAX自我测试完整流程_SH_V005.md](design/StatJAX自我测试完整流程_SH_V005.md) | Complete self-test process of StatJAX from scratch (for statjax 0.5.1) |
 | [StatJAX自我测试完整流程_SH_V006.md](design/StatJAX自我测试完整流程_SH_V006.md) | Complete self-test process of StatJAX from scratch (for statjax 0.6.1) |
 | [StatJAX自我测试完整流程_SH_V007.md](design/StatJAX自我测试完整流程_SH_V007.md) | Complete self-test process of StatJAX from scratch (for statjax 0.7.1) |
+| [StatJAX自我测试完整流程_SH_V008.md](design/StatJAX自我测试完整流程_SH_V008.md) | Complete self-test process of StatJAX from scratch (for statjax 0.8.1) |
 </details>
 
 ## 4.algorithm
@@ -190,10 +201,18 @@ For the complete self-test process from scratch, see [StatJAX自我测试完整�
 | regression | QRProbitComponent | Unregularized binary Probit maximum-likelihood estimation solved by Fisher scoring/IRLS and column-pivoted Householder QR, with numerical-rank errors and Armijo step halving | Stable normal log-CDF likelihood; caller-prepared intercept and preprocessing; two-column normal-CDF probabilities and binary classes; selective JIT matrix kernels with host-controlled diagnostics |
 | regression | QRMultinomialLogisticComponent | Multinomial Logistic regression with reference-category Softmax and unaveraged L2-regularized cross-entropy, solved by jointly coupled IRLS, per-sample Cholesky whitening and handwritten column-pivoted Householder QR with Armijo backtracking | Explicit K and training-only standardization; unpenalized intercepts; K-column probabilities and int32 argmax classes; selective JIT matrix kernels with host-controlled line search; intended for small and medium dense data |
 | regression | GHKMultinomialProbitComponent | Correlated multinomial Probit regression with a final reference class and Sigma[0,0]=1, solved by scale-constrained Cholesky parameterization, class contrasts, GHK simulation, fixed-common-random-number MSL and automatic-differentiation BFGS | Three-dimensional A(n,D,p) with D=J-1; caller-controlled alternative encoding and preprocessing; J-column probabilities from independent inference draws with optional row normalization; int32 argmax classes; intended for small and medium dense data |
+| regression | SMOSVRComponent | Exact RBF support vector regression solved through the compact dual, KKT maximum-violation selection, second-order working sets and exact piecewise-quadratic pair updates | Training-only X/y standardization; O(n) incremental gradients; fully JIT-compiled lax.while_loop; sparse support-vector predictions with inverse standardization; O(n²) kernel memory and small/medium dense-data boundary |
 
 ## 5.ChangeLog
 <details>
 <summary>Click to view ChangeLog</summary>
+
+### Version-0.8.1
+  - Added the regression component SMOSVRComponent (RBF kernel, compact dual, second-order SMO, exact pair subproblems and fully compiled lax.while_loop)
+  - Added the unit test file statjax/tests/test_svr.py with 17 kernel, KKT, dual-constraint, inference and validation tests
+  - Updated example/example_008.py to use the public component with reproducibility and numerical diagnostics
+  - Deepened project-wide comments, integrating the overall design and support vector regression algorithm document (StatJAX008)
+  - Updated the self-test process document to StatJAX自我测试完整流程_SH_V008.md
 
 ### Version-0.7.1
   - Added the regression component GHKMultinomialProbitComponent (scale-constrained Cholesky, class contrasts, GHK, fixed-draw MSL and automatic-differentiation BFGS)

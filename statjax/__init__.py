@@ -88,7 +88,7 @@ Usage examples
 .. code-block:: python
     :linenos:
 
-    from statjax.regression import HouseholderOLSComponent,QRLogisticComponent,QRProbitComponent,QRMultinomialLogisticComponent,GHKMultinomialProbitComponent,SMOSVRComponent
+    from statjax.regression import HouseholderOLSComponent,QRLogisticComponent,QRProbitComponent,QRMultinomialLogisticComponent,GHKMultinomialProbitComponent,SMOSVRComponent,SMOMulticlassSVMComponent
 
     ### Train the OLS model and solve the optimal regression coefficients
     ols_instance = HouseholderOLSComponent()
@@ -127,6 +127,12 @@ Usage examples
     beta_hat,metrics = svr_instance.train(A=A_svr_train,b=b_svr_train)
     y_pred = svr_instance.reasoning(A_test=A_svr_test)
 
+    ### Multiclass C-SVM also preserves the unified interface but returns class labels
+    svm_instance = SMOMulticlassSVMComponent(C=2.0,gamma=0.5,strategy="ovo")
+    alpha_hat,metrics = svm_instance.train(A=A_multiclass_train,b=b_multiclass_train)
+    ### OvO uses votes and OvR uses maximum decision values; neither returns probabilities
+    class_pred = svm_instance.reasoning(A_test=A_multiclass_test)
+
 Class Description
 -----------------
 
@@ -135,6 +141,8 @@ References
 StatJAX Design Document `"StatJAX Design SH V001"<https://github.com/redblue0216/statjax>`_
 
 StatJAX008 Support Vector Regression Design Document `"StatJAX008 SVM SH V001"<https://github.com/redblue0216/statjax>`_
+
+StatJAX009 Multiclass C-SVM Design Document `"StatJAX009 Multiclass SVM SH V001"<https://github.com/redblue0216/statjax>`_
 '''
 
 
@@ -166,13 +174,13 @@ def _read_version() -> str:
         text = pyproject.read_text(encoding='utf-8')
         import re as _re
         m = _re.search(r'^version\s*=\s*"([^"]+)"', text, _re.M)
-        return m.group(1) if m else '0.8.1'
+        return m.group(1) if m else '0.9.1'
     except Exception:
         pass
     try:
         return _im.version('statjax')
     except Exception:
-        return '0.8.1'
+        return '0.9.1'
 
 
 

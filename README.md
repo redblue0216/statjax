@@ -58,7 +58,7 @@ python build.py --clean --install
 import jax
 import jax.numpy as jnp
 from jax.scipy.stats import norm
-from statjax.regression import HouseholderOLSComponent, SVDRidgeComponent, CDLassoComponent, QRLogisticComponent, QRProbitComponent, QRMultinomialLogisticComponent, GHKMultinomialProbitComponent, SMOSVRComponent
+from statjax.regression import HouseholderOLSComponent, SVDRidgeComponent, CDLassoComponent, QRLogisticComponent, QRProbitComponent, QRMultinomialLogisticComponent, GHKMultinomialProbitComponent, SMOSVRComponent, SMOMulticlassSVMComponent
 
 # Prepare the training data (column full rank design matrix A and observation labels b)
 A_train = jax.random.normal(jax.random.PRNGKey(0), (100, 5))
@@ -133,6 +133,14 @@ b_svr = jnp.sin(A_svr[:, 0])
 svr = SMOSVRComponent(C=10.0, epsilon=0.05, gamma=0.5)
 svr_beta, metrics = svr.train(A=A_svr, b=b_svr)  # complete compact dual, (40,)
 y_pred = svr.reasoning(A_test=A_svr)             # original target scale, (40,)
+
+# Train multiclass C-SVM with RBF kernels and OvO/OvR decomposition (distinct from SVR)
+A_svm = jnp.array([[-2.0, -2.0], [-2.2, -1.8], [2.0, -2.0], [2.2, -1.8], [0.0, 2.2], [0.2, 2.0]], dtype=jnp.float64)
+b_svm = jnp.array([0, 0, 1, 1, 2, 2], dtype=jnp.int32)
+for strategy in ("ovo", "ovr"):
+    svm = SMOMulticlassSVMComponent(C=2.0, gamma=0.5, strategy=strategy)
+    alpha_hat, metrics = svm.train(A=A_svm, b=b_svm)
+    class_pred = svm.reasoning(A_test=A_svm)  # int32 classes, not probabilities
 ```
 
 Runnable end-to-end demos:
@@ -146,6 +154,7 @@ python example/example_005.py   # Binary Probit regression (Fisher scoring + piv
 python example/example_006.py   # Multinomial Logistic regression (whitened IRLS + handwritten pivoted QR)
 python example/example_007.py   # Multinomial Probit regression (Cholesky + GHK + MSL + BFGS)
 python example/example_008.py   # RBF support vector regression (second-order SMO)
+python example/example_009.py   # Multiclass C-SVM (RBF kernel, OvO/OvR and second-order SMO)
 ```
 
 Run unit tests:
@@ -155,11 +164,11 @@ pip install pytest
 python -m pytest -v
 ```
 
-For the complete self-test process from scratch, see [StatJAX自我测试完整流程_SH_V008.md](design/StatJAX自我测试完整流程_SH_V008.md).
+For the complete self-test process from scratch, see [StatJAX自我测试完整流程_SH_V009.md](design/StatJAX自我测试完整流程_SH_V009.md).
 
 ### 3.3 design
 <details>
-<summary>Click to view design documents (24 files)</summary>
+<summary>Click to view design documents (27 files)</summary>
 
 | File | Description |
 |:----|:----|
@@ -180,6 +189,8 @@ For the complete self-test process from scratch, see [StatJAX自我测试完整�
 | [StatJAX007_多分类probit_SH_V001.md](design/StatJAX007_多分类probit_SH_V001.md) | Multinomial Probit algorithm document: scale-constrained Cholesky, GHK, fixed-draw MSL and automatic-differentiation BFGS |
 | [StatJAX008_实施方案_SH_V001.md](design/StatJAX008_实施方案_SH_V001.md) | Implementation plan for the StatJAX008 iteration |
 | [StatJAX008_SVM_SH_V001.md](design/StatJAX008_SVM_SH_V001.md) | Support vector regression algorithm document: RBF kernels, compact duals, second-order SMO and fully compiled device-side iteration |
+| [StatJAX009_实施方案_SH_V001.md](design/StatJAX009_实施方案_SH_V001.md) | Implementation plan for the StatJAX009 iteration |
+| [StatJAX009_多分类SVM_SH_V001.md](design/StatJAX009_多分类SVM_SH_V001.md) | Multiclass C-SVM algorithm document: RBF kernels, OvO/OvR decomposition, second-order SMO and fully compiled device-side iteration |
 | [StatJAX自我测试完整流程_SH_V002.md](design/StatJAX自我测试完整流程_SH_V002.md) | Complete self-test process of StatJAX from scratch (for statjax 0.2.1) |
 | [StatJAX自我测试完整流程_SH_V003.md](design/StatJAX自我测试完整流程_SH_V003.md) | Complete self-test process of StatJAX from scratch (for statjax 0.3.1) |
 | [StatJAX自我测试完整流程_SH_V004.md](design/StatJAX自我测试完整流程_SH_V004.md) | Complete self-test process of StatJAX from scratch (for statjax 0.4.1) |
@@ -187,6 +198,7 @@ For the complete self-test process from scratch, see [StatJAX自我测试完整�
 | [StatJAX自我测试完整流程_SH_V006.md](design/StatJAX自我测试完整流程_SH_V006.md) | Complete self-test process of StatJAX from scratch (for statjax 0.6.1) |
 | [StatJAX自我测试完整流程_SH_V007.md](design/StatJAX自我测试完整流程_SH_V007.md) | Complete self-test process of StatJAX from scratch (for statjax 0.7.1) |
 | [StatJAX自我测试完整流程_SH_V008.md](design/StatJAX自我测试完整流程_SH_V008.md) | Complete self-test process of StatJAX from scratch (for statjax 0.8.1) |
+| [StatJAX自我测试完整流程_SH_V009.md](design/StatJAX自我测试完整流程_SH_V009.md) | Complete self-test process of StatJAX from scratch (for statjax 0.9.1) |
 </details>
 
 ## 4.algorithm
@@ -202,10 +214,19 @@ For the complete self-test process from scratch, see [StatJAX自我测试完整�
 | regression | QRMultinomialLogisticComponent | Multinomial Logistic regression with reference-category Softmax and unaveraged L2-regularized cross-entropy, solved by jointly coupled IRLS, per-sample Cholesky whitening and handwritten column-pivoted Householder QR with Armijo backtracking | Explicit K and training-only standardization; unpenalized intercepts; K-column probabilities and int32 argmax classes; selective JIT matrix kernels with host-controlled line search; intended for small and medium dense data |
 | regression | GHKMultinomialProbitComponent | Correlated multinomial Probit regression with a final reference class and Sigma[0,0]=1, solved by scale-constrained Cholesky parameterization, class contrasts, GHK simulation, fixed-common-random-number MSL and automatic-differentiation BFGS | Three-dimensional A(n,D,p) with D=J-1; caller-controlled alternative encoding and preprocessing; J-column probabilities from independent inference draws with optional row normalization; int32 argmax classes; intended for small and medium dense data |
 | regression | SMOSVRComponent | Exact RBF support vector regression solved through the compact dual, KKT maximum-violation selection, second-order working sets and exact piecewise-quadratic pair updates | Training-only X/y standardization; O(n) incremental gradients; fully JIT-compiled lax.while_loop; sparse support-vector predictions with inverse standardization; O(n²) kernel memory and small/medium dense-data boundary |
+| regression | SMOMulticlassSVMComponent | Exact RBF multiclass C-SVM solved by OvO/OvR decomposition, KKT maximum-violation selection, second-order working sets and analytic pair updates | Fully JIT-compiled fixed-shape lax.while_loop; O(n) incremental gradients; correctly signed bias recovery and per-binary diagnostics; OvO voting and OvR maximum-score int32 classes without probability outputs; O(n²) kernel memory and small/medium dense-data boundary |
 
 ## 5.ChangeLog
 <details>
 <summary>Click to view ChangeLog</summary>
+
+### Version-0.9.1
+  - Added the regression component SMOMulticlassSVMComponent (RBF kernel, OvO/OvR decomposition, second-order SMO, analytic pair updates and fully compiled lax.while_loop)
+  - Added the unit test file statjax/tests/test_multiclass_svm.py with 28 kernel, KKT, dual-constraint, bias-sign, inference and validation tests
+  - Updated example/example_009.py to use the public component with reproducibility and numerical diagnostics
+  - Corrected the multiclass SVM bias-recovery sign in code, comments and the StatJAX009 algorithm document
+  - Deepened project-wide comments, integrating the overall design and multiclass C-SVM algorithm document (StatJAX009)
+  - Updated the self-test process document to StatJAX自我测试完整流程_SH_V009.md
 
 ### Version-0.8.1
   - Added the regression component SMOSVRComponent (RBF kernel, compact dual, second-order SMO, exact pair subproblems and fully compiled lax.while_loop)

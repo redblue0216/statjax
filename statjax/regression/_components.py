@@ -28,6 +28,8 @@ This is a collection of concrete regression, support vector regression, binary-c
 
     (4) RBF kernel matrices, compact SVR dual variables, KKT working-set selection, exact piecewise-quadratic pair subproblems, O(n) gradient updates and fully compiled lax.while_loop SMO iteration
 
+    (5) Multiclass C-SVM with OvO/OvR decomposition, second-order KKT working sets, analytic equality-preserving pair updates, correctly signed bias recovery and sparse voting or maximum-score inference
+
 - Main functions:
 
     (1) Linear regression, regularized regression and sparse regression
@@ -38,12 +40,14 @@ This is a collection of concrete regression, support vector regression, binary-c
 
     (4) Exact small and medium dense RBF support vector regression with sparse support-vector inference
 
+    (5) Exact small and medium dense RBF multiclass C-SVM with per-binary numerical diagnostics and int32 class inference
+
 Usage examples
 --------------
 .. code-block:: python
     :linenos:
 
-    from statjax.regression import HouseholderOLSComponent,SVDRidgeComponent,CDLassoComponent,QRLogisticComponent,QRProbitComponent,QRMultinomialLogisticComponent,GHKMultinomialProbitComponent,SMOSVRComponent
+    from statjax.regression import HouseholderOLSComponent,SVDRidgeComponent,CDLassoComponent,QRLogisticComponent,QRProbitComponent,QRMultinomialLogisticComponent,GHKMultinomialProbitComponent,SMOSVRComponent,SMOMulticlassSVMComponent
 
     ### Train the OLS model and solve the optimal regression coefficients
     ols_instance = HouseholderOLSComponent()
@@ -96,6 +100,12 @@ Usage examples
     ### The support vectors and dual coefficients are retained for sparse inference
     y_pred = svr_instance.reasoning(A_test=A_svr_test)
 
+    ### Multiclass C-SVM is distinct from SVR and supports OvO and OvR
+    svm_instance = SMOMulticlassSVMComponent(C=2.0,gamma=0.5,strategy="ovo")
+    alpha_hat,metrics = svm_instance.train(A=A_multiclass_train,b=b_multiclass_train)
+    ### Decision values are combined by votes or maximum scores, not probabilities
+    class_pred = svm_instance.reasoning(A_test=A_multiclass_test)
+
 Class Description
 -----------------
 (1)TestRegression: This is a regression test placeholder component implementation class, the main function is to verify the framework link, the main technical inheritance
@@ -115,6 +125,8 @@ Class Description
 (8)GHKMultinomialProbitComponent: This is a correlated multinomial Probit component based on scale-constrained Cholesky covariance parameters, GHK choice-probability simulation, fixed-draw MSL and BFGS, with independent inference draws, J-class probabilities and argmax classification
 
 (9)SMOSVRComponent: This is an RBF support vector regression component based on compact-dual second-order SMO, exact pair subproblems, KKT convergence checks, sparse support-vector inference and a fully compiled lax.while_loop
+
+(10)SMOMulticlassSVMComponent: This is an exact RBF multiclass C-SVM component based on OvO/OvR decomposition, second-order working-set SMO, analytic pair updates, correctly signed bias recovery, per-binary KKT diagnostics and sparse voting or maximum-score inference
 
 References
 ----------
@@ -169,6 +181,8 @@ References
 - StatJAX007 Multinomial Probit Design Document `"StatJAX007 Multinomial Probit SH V001"<https://github.com/redblue0216/statjax>`_
 
 - StatJAX008 Support Vector Regression Design Document `"StatJAX008 SVM SH V001"<https://github.com/redblue0216/statjax>`_
+
+- StatJAX009 Multiclass C-SVM Design Document `"StatJAX009 Multiclass SVM SH V001"<https://github.com/redblue0216/statjax>`_
 '''
 
 
@@ -229,6 +243,9 @@ jax.config.update("jax_enable_x64",True)
 ###
 ### class:SMOSVRComponent
 ### ------This is an RBF support vector regression component based on compact-dual second-order SMO, exact pair subproblems, KKT diagnostics and fully compiled device-side iteration
+###
+### class:SMOMulticlassSVMComponent
+### ------This is an exact RBF multiclass C-SVM component based on OvO/OvR decomposition, second-order SMO, analytic pair updates and sparse class inference
 ###
 ################################################################################################################################################################################
 
@@ -4892,6 +4909,835 @@ class SMOSVRComponent(BaseRegression):
         '''
 
         return "SMOSVRComponent: RBF support vector regression component based on compact-dual second-order SMO and exact pair subproblems, implemented with the JAX technology stack"
+
+
+
+##############################################################################################################################################################################
+##############################################################################################################################################################################
+
+
+
+def _svm_rbf_kernel(X,Z,gamma):
+    '''Method Function:
+
+        Define an RBF kernel matrix using matrix multiplication and broadcasting:
+
+        $K_ij=exp(-gamma*||X_i-Z_j||_2^2)$
+        Kᵢⱼ = exp(−γ‖Xᵢ−Zⱼ‖₂²)
+
+        The identity $||X_i-Z_j||^2=||X_i||^2+||Z_j||^2-2*X_i^T*Z_j$ (‖Xᵢ−Zⱼ‖² = ‖Xᵢ‖²+‖Zⱼ‖²−2XᵢᵀZⱼ) replaces Python sample loops with one matrix product. A valid RBF kernel is symmetric positive semidefinite. Round-off can create small negative distances, which are clipped to zero before exponentiation; duplicate samples can nevertheless create near-zero pair curvature
+
+    :parameters:
+        - X (jnp.ndarray) - (n,p) First feature matrix
+        - Z (jnp.ndarray) - (m,p) Second feature matrix
+        - gamma (float) - Positive RBF kernel scale
+
+    :return:
+        - kernel (jnp.ndarray) - (n,m) RBF kernel matrix
+    '''
+
+    ### Distance matrixization: ||x-z||² = ||x||² + ||z||² − 2xᵀz
+    x_squared = jnp.sum(X * X,axis=1)[:,None]
+    z_squared = jnp.sum(Z * Z,axis=1)[None,:]
+    distance_squared = x_squared + z_squared - 2.0 * (X @ Z.T)
+    ### Protect the fixed-shape exponential calculation from negative round-off distances
+    distance_squared = jnp.maximum(distance_squared,0.0)
+
+    return jnp.exp(-gamma * distance_squared)
+
+
+
+def _svm_working_sets(alpha,grad,y,C):
+    '''Method Function:
+
+        Define fixed-shape arrays for the C-SVM KKT working sets. With $g=Q*alpha-1$ (g = Qα−1), define $p=-y*grad$ (p = −y ⊙ g) and:
+
+        $I_up={i|y_i=+1,alpha_i<C} union {i|y_i=-1,alpha_i>0}$
+        I_up = {i | yᵢ=+1, αᵢ<C} ∪ {i | yᵢ=−1, αᵢ>0}
+
+        $I_low={i|y_i=-1,alpha_i<C} union {i|y_i=+1,alpha_i>0}$
+        I_low = {i | yᵢ=−1, αᵢ<C} ∪ {i | yᵢ=+1, αᵢ>0}
+
+        Invalid entries are replaced by signed infinities rather than dynamic index lists. This permits static argmax/argmin reductions inside JIT. The stopping residual is $m-M=max(I_up)-min(I_low)$ (m−M = max I_up−min I_low)
+
+    :parameters:
+        - alpha (jnp.ndarray) - (n,) Binary-classification dual variables
+        - grad (jnp.ndarray) - (n,) Dual gradient Q@alpha-1
+        - y (jnp.ndarray) - (n,) Internal labels in {-1,+1}
+        - C (float) - Positive box-constraint bound
+
+    :return:
+        - p (jnp.ndarray) - (n,) Values -y*grad
+        - p_up (jnp.ndarray) - (n,) Values eligible for I_up, otherwise -infinity
+        - p_low (jnp.ndarray) - (n,) Values eligible for I_low, otherwise +infinity
+    '''
+
+    p = -y * grad
+    ### Box and label conditions determine which KKT inequalities can move in each direction
+    up = ((y > 0) & (alpha < C)) | ((y < 0) & (alpha > 0))
+    low = ((y < 0) & (alpha < C)) | ((y > 0) & (alpha > 0))
+    ### Signed infinities preserve fixed shapes; they do not represent valid candidates
+    p_up = jnp.where(up,p,-jnp.inf)
+    p_low = jnp.where(low,p,jnp.inf)
+
+    return p,p_up,p_low
+
+
+
+def _solve_svm_pair(K,y,alpha,grad,C,curvature_tolerance,i,j):
+    '''Method Function:
+
+        Solve one C-SVM pair subproblem using the equality-preserving parameterization:
+
+        $alpha_i'=alpha_i+y_i*s , alpha_j'=alpha_j-y_j*s$
+        αᵢ′ = αᵢ+yᵢs, αⱼ′ = αⱼ−yⱼs
+
+        Thus $y_i*Delta_alpha_i+y_j*Delta_alpha_j=0$ (yᵢΔαᵢ+yⱼΔαⱼ = 0) by construction. With $eta=K_ii+K_jj-2*K_ij$ (η = Kᵢᵢ+Kⱼⱼ−2Kᵢⱼ), the unconstrained stationary step is:
+
+        $s_unc=(y_j*g_j-y_i*g_i)/max(eta,tau)$
+        s_unc = (yⱼgⱼ−yᵢgᵢ)/max(η,τ)
+
+        The two box constraints produce one feasible interval [s_min,s_max]. Clipping the stationary point handles same-label and opposite-label pairs without separate update formulas and protects repeated samples through the positive curvature floor tau
+
+    :parameters:
+        - K (jnp.ndarray) - (n,n) Training kernel matrix
+        - y (jnp.ndarray) - (n,) Internal binary labels
+        - alpha (jnp.ndarray) - (n,) Current dual variables
+        - grad (jnp.ndarray) - (n,) Current dual gradient
+        - C (float) - Positive box-constraint bound
+        - curvature_tolerance (float) - Positive curvature floor
+        - i (int or jax.Array) - First working-set index
+        - j (int or jax.Array) - Second working-set index
+
+    :return:
+        - step (jnp.ndarray) - Scalar optimal feasible pair-update step
+    '''
+
+    yi,yj = y[i],y[j]
+    ai,aj = alpha[i],alpha[j]
+    gi,gj = grad[i],grad[j]
+    ### Protect the one-dimensional quadratic direction from zero or negative round-off curvature
+    curvature = K[i,i] + K[j,j] - 2.0 * K[i,j]
+    curvature = jnp.maximum(curvature,curvature_tolerance)
+    unconstrained = (yj * gj - yi * gi) / curvature
+
+    ### Intersect the feasible intervals induced by 0<=alpha_i<=C and 0<=alpha_j<=C
+    lower_i = jnp.where(yi > 0,-ai,ai - C)
+    upper_i = jnp.where(yi > 0,C - ai,ai)
+    lower_j = jnp.where(yj > 0,aj - C,-aj)
+    upper_j = jnp.where(yj > 0,aj,C - aj)
+    lower = jnp.maximum(lower_i,lower_j)
+    upper = jnp.minimum(upper_i,upper_j)
+
+    return jnp.clip(unconstrained,lower,upper)
+
+
+
+class _SMOSVMState(NamedTuple):
+    '''Class Introduction:
+
+        This is the fixed-shape functional PyTree state used by the compiled C-SVM while loop. Every array keeps its shape and dtype across iterations; support vectors are never removed inside the device loop
+
+    :parameters:
+        - alpha (jax.Array) - (n,) Dual variables satisfying y.T@alpha=0 and 0<=alpha<=C
+        - grad (jax.Array) - (n,) Incrementally maintained Q@alpha-1
+        - iteration (jax.Array) - Scalar int32 pair-update count
+        - m (jax.Array) - Scalar max_{I_up}(-y*grad)
+        - M (jax.Array) - Scalar min_{I_low}(-y*grad)
+    '''
+
+    alpha: jax.Array
+    grad: jax.Array
+    iteration: jax.Array
+    m: jax.Array
+    M: jax.Array
+
+
+
+def _smo_binary_svm(K,y,C,tolerance,max_iterations,curvature_tolerance):
+    '''Method Function:
+
+        Solve the binary C-SVM dual through second-order working-set sequential minimal optimization:
+
+        $min_alpha 0.5*alpha^T*Q*alpha-1^T*alpha , Q=diag(y)Kdiag(y)$
+        min_α ½αᵀQα−1ᵀα, Q = diag(y)Kdiag(y)
+
+        $y^T*alpha=0 , 0<=alpha_i<=C$
+        yᵀα = 0, 0 ≤ αᵢ ≤ C
+
+        Only K is stored. The required Q rows are reconstructed as $Q_i=y_i*y*K_i$ (Qᵢ,: = yᵢy ⊙ Kᵢ,:). The first index maximizes the one-order KKT violation. All legal second candidates are scored by $-b_it^2/max(eta_it,tau)$ (−bᵢₜ²/max(ηᵢₜ,τ)); an empty candidate mask falls back to the first-order minimum. After the exact clipped pair step, the gradient is updated in O(n):
+
+        $g <- g+Delta_alpha_i*Q_i+Delta_alpha_j*Q_j$
+        g ← g+ΔαᵢQᵢ,:+ΔαⱼQⱼ,:
+
+        lax.while_loop compiles selection, updates and stopping into one fixed-shape device-side computation. The loop stops when m-M<=tolerance or max_iterations is reached; the latter is not itself a convergence proof
+
+    :parameters:
+        - K (jnp.ndarray) - (n,n) Training kernel matrix
+        - y (jnp.ndarray) - (n,) Internal labels in {-1,+1}
+        - C (float) - Positive box-constraint bound
+        - tolerance (float) - Positive KKT stopping tolerance
+        - max_iterations (int) - Positive pair-update budget
+        - curvature_tolerance (float) - Positive curvature floor
+
+    :return:
+        - state (_SMOSVMState) - Final dual, gradient, iteration count and KKT extrema
+    '''
+
+    n = y.shape[0]
+    diagonal = jnp.diag(K)
+    initial_state = _SMOSVMState(
+        alpha=jnp.zeros(n,dtype=jnp.float64),
+        grad=-jnp.ones(n,dtype=jnp.float64),
+        iteration=jnp.array(0,dtype=jnp.int32),
+        m=jnp.array(jnp.inf,dtype=jnp.float64),
+        M=jnp.array(-jnp.inf,dtype=jnp.float64)
+    )
+
+    def condition(state):
+        '''Method Function:
+
+            Continue while the KKT violation exceeds tolerance and iterations remain
+        '''
+
+        return (state.iteration < max_iterations) & ((state.m - state.M) > tolerance)
+
+    def body(state):
+        '''Method Function:
+
+            Execute one second-order pair selection and an O(n) gradient update
+        '''
+
+        alpha,grad = state.alpha,state.grad
+        ### First-order selection: maximize the KKT violation over I_up
+        p,p_up,p_low = _svm_working_sets(alpha,grad,y,C)
+        i = jnp.argmax(p_up)
+        m = p_up[i]
+
+        ### Vectorized second-order selection: maximize the approximate feasible descent
+        curvature = diagonal[i] + diagonal - 2.0 * K[i,:]
+        violation = m - p
+        candidates = jnp.isfinite(p_low) & (p < m)
+        second_order_objective = jnp.where(
+            candidates,
+            -(violation * violation) / jnp.maximum(curvature,curvature_tolerance),
+            jnp.inf
+        )
+        j_second = jnp.argmin(second_order_objective)
+        j_first = jnp.argmin(p_low)
+        ### An all-masked reduction is not a candidate; fall back to first-order selection
+        j = jnp.where(jnp.any(candidates),j_second,j_first)
+        step = _solve_svm_pair(K,y,alpha,grad,C,curvature_tolerance,i,j)
+
+        ### Equality-preserving immutable dual update
+        delta_i = y[i] * step
+        delta_j = -y[j] * step
+        alpha_new = alpha.at[i].add(delta_i).at[j].add(delta_j)
+        ### Reconstruct only two Q rows and update the gradient in O(n), never form complete Q
+        Q_i = y[i] * y * K[i,:]
+        Q_j = y[j] * y * K[j,:]
+        grad_new = grad + delta_i * Q_i + delta_j * Q_j
+        _,p_up_new,p_low_new = _svm_working_sets(alpha_new,grad_new,y,C)
+
+        return _SMOSVMState(
+            alpha=alpha_new,
+            grad=grad_new,
+            iteration=state.iteration + 1,
+            m=jnp.max(p_up_new),
+            M=jnp.min(p_low_new)
+        )
+
+    return lax.while_loop(condition,body,initial_state)
+
+
+
+def _recover_svm_bias(K,y,alpha,grad,C,free_tolerance=1e-8):
+    '''Method Function:
+
+        Recover the intercept in $f(x)=sum_i(alpha_i*y_i*K(x_i,x))+b$ (f(x) = ΣᵢαᵢyᵢK(xᵢ,x)+b). Define $r=K@(alpha*y)$ (r = K(α ⊙ y)). Every free support vector satisfies:
+
+        $y_i*(r_i+b)=1  =>  b=y_i-r_i$
+        yᵢ(rᵢ+b) = 1 ⇒ b = yᵢ−rᵢ
+
+        The implementation averages y-r over free support vectors. If none exists, it uses the final KKT interval with the same sign convention. Since $p=-y*grad=y-r$ (p = −yg = y−r) and free support vectors have p=b, the fallback is $b=(m+M)/2$ (b = (m+M)/2), not its negative. Host execution keeps dynamic free-support selection outside the fixed-shape JIT loop
+
+    :parameters:
+        - K (np.ndarray or jnp.ndarray) - (n,n) Training kernel matrix
+        - y (np.ndarray or jnp.ndarray) - (n,) Internal binary labels
+        - alpha (np.ndarray or jnp.ndarray) - (n,) Final dual variables
+        - grad (np.ndarray or jnp.ndarray) - (n,) Final dual gradient
+        - C (float) - Positive box-constraint bound
+        - free_tolerance (float) - Positive numerical tolerance for free support vectors
+
+    :return:
+        - intercept (float) - Binary decision-function intercept
+    '''
+
+    y = np.asarray(y,dtype=np.float64)
+    alpha = np.asarray(alpha,dtype=np.float64)
+    grad = np.asarray(grad,dtype=np.float64)
+    raw = np.asarray(K,dtype=np.float64) @ (alpha * y)
+    free = (alpha > free_tolerance) & (alpha < C - free_tolerance)
+    if np.any(free):
+        ### y_i*(raw_i+b)=1 implies b=y_i-raw_i for 0<alpha_i<C
+        return float(np.mean(y[free] - raw[free]))
+
+    ### Without free support vectors, average the final KKT extrema without changing their sign
+    p = -y * grad
+    up = ((y > 0) & (alpha < C)) | ((y < 0) & (alpha > 0))
+    low = ((y < 0) & (alpha < C)) | ((y > 0) & (alpha > 0))
+    m = np.max(p[up])
+    M = np.min(p[low])
+
+    return float(0.5 * (m + M))
+
+
+
+def _fit_smo_multiclass_svm(X,y,classes,C,gamma,strategy,tolerance,max_iterations,curvature_tolerance,support_tolerance):
+    '''Method Function:
+
+        Define multiclass training as a static host-side composition of fixed-shape binary SMO tasks. The complete training kernel is evaluated once. For L classes:
+
+        (1) OvO enumerates L(L-1)/2 pairs and uses $K_ab=K[I_ab,I_ab]$ (Kᵃᵇ = K[ℐₐᵦ,ℐₐᵦ]) with only the two corresponding classes
+
+        (2) OvR constructs L tasks, maps one class to +1 and all remaining classes to -1, and reuses the same complete K
+
+        Each binary task returns to the host only after its compiled while loop ends. The final gradient is independently recomputed as $g_exact=y*K@(y*alpha)-1$ (g_exact = y ⊙ K(y ⊙ α)−1) to detect incremental drift. equality_error, box_error and kkt_violation are recorded per task; aggregate convergence requires every task to satisfy tolerance
+
+        Nonzero dual entries define support vectors with coefficients $theta=alpha*y$ (θ = α ⊙ y). Pruning happens outside JIT. Complete alpha segments are concatenated in deterministic task order, and dual_offsets plus sample_indices preserve their exact meaning without padding ragged OvO tasks
+
+    :parameters:
+        - X (jnp.ndarray) - (n,p) Validated training features
+        - y (jnp.ndarray) - (n,) Validated integer class labels
+        - classes (np.ndarray) - Sorted unique training classes
+        - C (float) - Positive box-constraint bound
+        - gamma (float) - Positive RBF kernel scale
+        - strategy (str) - Either ovo or ovr
+        - tolerance (float) - Positive KKT tolerance
+        - max_iterations (int) - Positive pair-update budget per binary task
+        - curvature_tolerance (float) - Positive curvature floor
+        - support_tolerance (float) - Non-negative support-vector pruning threshold
+
+    :return:
+        - result (dict) - Complete dual, sparse binary models and numerical diagnostics
+    '''
+
+    X_values = np.asarray(X,dtype=np.float64)
+    y_values = np.asarray(y,dtype=np.int64)
+    K_full = np.asarray(_svm_rbf_kernel(X,X,gamma),dtype=np.float64)
+    jobs = []
+
+    if strategy == "ovo":
+        for a_position in range(len(classes) - 1):
+            for b_position in range(a_position + 1,len(classes)):
+                a,b = int(classes[a_position]),int(classes[b_position])
+                indices = np.flatnonzero((y_values == a) | (y_values == b))
+                y_binary = np.where(y_values[indices] == a,1.0,-1.0)
+                K_job = K_full[np.ix_(indices,indices)]
+                jobs.append((a,b,indices,K_job,y_binary))
+    else:
+        indices = np.arange(len(y_values))
+        for class_value in classes:
+            a = int(class_value)
+            y_binary = np.where(y_values == a,1.0,-1.0)
+            jobs.append((a,None,indices,K_full,y_binary))
+
+    solve = jax.jit(
+        lambda kernel,target: _smo_binary_svm(
+            kernel,target,C,tolerance,max_iterations,curvature_tolerance
+        )
+    )
+    alpha_segments = []
+    binary_models = []
+    diagnostics = []
+    dual_offsets = [0]
+
+    for a,b,indices,K_job,y_binary in jobs:
+        state = jax.device_get(solve(K_job,y_binary))
+        if (
+            not np.all(np.isfinite(state.alpha))
+            or not np.all(np.isfinite(state.grad))
+            or not np.isfinite(state.m)
+            or not np.isfinite(state.M)
+        ):
+            raise RuntimeError("SVM optimization produced non-finite parameters or diagnostics")
+
+        alpha = np.asarray(state.alpha,dtype=np.float64)
+        intercept = _recover_svm_bias(K_job,y_binary,alpha,state.grad,C)
+        if not np.isfinite(intercept):
+            raise RuntimeError("SVM bias recovery produced a non-finite intercept")
+
+        support = np.abs(alpha) > support_tolerance
+        support_indices = indices[support]
+        alpha_segments.append(jnp.asarray(alpha,dtype=jnp.float64))
+        binary_models.append({
+            "class_a": a,
+            "class_b": b,
+            "sample_indices": jnp.asarray(indices,dtype=jnp.int32),
+            "support_vectors": jnp.asarray(X_values[indices[support]],dtype=jnp.float64),
+            "dual_coef": jnp.asarray(alpha[support] * y_binary[support],dtype=jnp.float64),
+            "support_indices": jnp.asarray(support_indices,dtype=jnp.int32),
+            "intercept": jnp.asarray(intercept,dtype=jnp.float64)
+        })
+
+        gradient_exact = y_binary * (K_job @ (y_binary * alpha)) - 1.0
+        equality_error = float(abs(y_binary @ alpha))
+        gradient_error = float(np.max(np.abs(gradient_exact - state.grad)))
+        box_error = float(max(0.0,np.max(-alpha),np.max(alpha - C)))
+        kkt_violation = float(state.m - state.M)
+        diagnostics.append({
+            "class_a": a,
+            "class_b": b,
+            "n_iter": int(state.iteration),
+            "kkt_violation": kkt_violation,
+            "equality_error": equality_error,
+            "gradient_error": gradient_error,
+            "box_error": box_error,
+            "n_support": int(np.count_nonzero(support)),
+            "converged": bool(kkt_violation <= tolerance)
+        })
+        dual_offsets.append(dual_offsets[-1] + alpha.size)
+
+    metrics = {
+        "strategy": strategy,
+        "n_classes": int(len(classes)),
+        "n_binary_models": int(len(jobs)),
+        "converged": bool(all(item["converged"] for item in diagnostics)),
+        "n_iter": int(sum(item["n_iter"] for item in diagnostics)),
+        "max_kkt_violation": float(max(item["kkt_violation"] for item in diagnostics)),
+        "max_equality_error": float(max(item["equality_error"] for item in diagnostics)),
+        "max_gradient_error": float(max(item["gradient_error"] for item in diagnostics)),
+        "max_box_error": float(max(item["box_error"] for item in diagnostics)),
+        "kernel_shape": tuple(K_full.shape),
+        "C": C,
+        "gamma": gamma,
+        "tolerance": tolerance,
+        "max_iterations": max_iterations,
+        "curvature_tolerance": curvature_tolerance,
+        "support_tolerance": support_tolerance,
+        "diagnostics": diagnostics
+    }
+
+    return {
+        "alpha_hat": jnp.concatenate(alpha_segments),
+        "classes": jnp.asarray(classes,dtype=jnp.int32),
+        "binary_models": binary_models,
+        "dual_offsets": jnp.asarray(dual_offsets,dtype=jnp.int32),
+        "metrics": metrics
+    }
+
+
+
+@jax.jit
+def _predict_binary_svm(A_test,support_vectors,dual_coef,intercept,gamma):
+    '''Method Function:
+
+        Define JIT-compiled sparse binary inference. For m test samples and s retained support vectors, only $K_test in R^(m*s)$ (K_test ∈ R^(m×s)) is constructed:
+
+        $f=K_test@dual_coef+b , dual_coef=alpha*y$
+        f = K_test·dual_coef+b, dual_coef = α ⊙ y
+
+        The score is a signed decision value, not a probability. Empty support sets produce the intercept-only score. No complete training-kernel allocation or SMO iteration is repeated during inference
+
+    :parameters:
+        - A_test (jnp.ndarray) - (m,p) Test feature matrix
+        - support_vectors (jnp.ndarray) - (s,p) Retained support vectors
+        - dual_coef (jnp.ndarray) - (s,) Values alpha*y for retained support vectors
+        - intercept (jnp.ndarray) - Scalar binary intercept
+        - gamma (float) - Positive RBF kernel scale
+
+    :return:
+        - score (jnp.ndarray) - (m,) Binary decision values
+    '''
+
+    K_test = _svm_rbf_kernel(A_test,support_vectors,gamma)
+
+    return K_test @ dual_coef + intercept
+
+
+
+class SMOMulticlassSVMComponent(BaseRegression):
+    '''Class Introduction:
+
+        This is an exact RBF multiclass C-SVM component based on One-vs-One (OvO) or One-vs-Rest (OvR) decomposition and second-order sequential minimal optimization (SMO). It solves binary classification duals inside fully compiled fixed-shape lax.while_loop states, then combines sparse binary decision functions through voting or maximum scores. It is intended for small and medium dense data whose precomputed kernel matrix fits in memory, teaching, algorithm verification and reproducible numerical reference workflows
+
+    Mathematical principle
+    ----------------------
+    (1) Scope and soft-margin primal: this component performs multiclass C-SVM classification, not support vector regression (SVR). SVR uses an epsilon-insensitive loss and two dual vectors alpha,alpha*, whereas C-SVM uses class labels and one bounded dual vector. Given $D={(x_i,c_i)}$ (𝒟 = {(xᵢ,cᵢ)}), $x_i in R^p$ (xᵢ ∈ Rᵖ) and L classes, each decomposed binary task uses internal labels $y_i in {-1,+1}$ (yᵢ ∈ {−1,+1}). Its primal problem is:
+
+        $min_{w,b,xi} 0.5*||w||_2^2+C*sum_i(xi_i)$
+        min ½‖w‖₂²+CΣᵢξᵢ
+
+        $y_i*(w^T*phi(x_i)+b)>=1-xi_i , xi_i>=0$
+        yᵢ(wᵀφ(xᵢ)+b) ≥ 1−ξᵢ, ξᵢ ≥ 0
+
+        C>0 controls the trade-off between margin complexity and training violations. The feature map phi enters only through inner products, so the implementation never constructs an explicit high-dimensional feature space
+
+    (2) Kernel dual and binary decision function: with $K_ij=phi(x_i)^T*phi(x_j)$ (Kᵢⱼ = φ(xᵢ)ᵀφ(xⱼ)), define $Q=diag(y)Kdiag(y)$ (Q = diag(y)Kdiag(y)). The binary dual is:
+
+        $min_alpha 0.5*alpha^T*Q*alpha-1^T*alpha$
+        min_α ½αᵀQα−1ᵀα
+
+        $y^T*alpha=0 , 0<=alpha_i<=C$
+        yᵀα = 0, 0 ≤ αᵢ ≤ C
+
+        The decision function is $f(x)=sum_i(alpha_i*y_i*K(x_i,x))+b$ (f(x) = ΣᵢαᵢyᵢK(xᵢ,x)+b). Nonzero alpha entries are support vectors with retained coefficients theta=alpha*y. Decision values and OvO vote counts are not calibrated class probabilities, so this component deliberately has no predict_proba method
+
+    (3) RBF matrixization and incremental gradients: the RBF kernel is $K(x,z)=exp(-gamma*||x-z||^2)$ (K(x,z) = exp(−γ‖x−z‖²)), gamma>0. Squared distances use $||x-z||^2=||x||^2+||z||^2-2*x^T*z$ (‖x−z‖² = ‖x‖²+‖z‖²−2xᵀz), allowing one matrix multiplication instead of nested sample loops. Small negative round-off distances are clipped to zero
+
+        The dual gradient is $g=Q*alpha-1$ (g = Qα−1), initially -1 when alpha=0. If only i,j change, then:
+
+        $g <- g+Delta_alpha_i*Q_i+Delta_alpha_j*Q_j$
+        g ← g+ΔαᵢQᵢ,:+ΔαⱼQⱼ,:
+
+        Only two rows $Q_i=y_i*y*K_i$ (Qᵢ,: = yᵢy ⊙ Kᵢ,:) and Q_j are reconstructed. The complete Q matrix is never materialized, and each gradient update costs O(n). Training independently recomputes y*K@(y*alpha)-1 afterward to detect numerical drift
+
+    (4) KKT stopping and second-order working sets: define $p=-y*g$ (p = −y ⊙ g) and the two index sets:
+
+        $I_up={i|y_i=+1,alpha_i<C} union {i|y_i=-1,alpha_i>0}$
+        I_up = {i | yᵢ=+1, αᵢ<C} ∪ {i | yᵢ=−1, αᵢ>0}
+
+        $I_low={i|y_i=-1,alpha_i<C} union {i|y_i=+1,alpha_i>0}$
+        I_low = {i | yᵢ=−1, αᵢ<C} ∪ {i | yᵢ=+1, αᵢ>0}
+
+        Let $m=max_(i in I_up)(p_i)$ (m = max I_up p) and $M=min_(i in I_low)(p_i)$ (M = min I_low p). Iteration stops when m-M<=tolerance. The first index is $i=argmax_(t in I_up)(p_t)$ (i = argmax I_up p). For each legal second candidate, define:
+
+        $eta_it=K_ii+K_tt-2*K_it , b_it=m-p_t>0$
+        ηᵢₜ = Kᵢᵢ+Kₜₜ−2Kᵢₜ, bᵢₜ = m−pₜ > 0
+
+        The second-order score is $-b_it^2/max(eta_it,tau)$ (−bᵢₜ²/max(ηᵢₜ,τ)). Fixed-shape signed-infinity masks support vectorized reductions. If no legal second-order candidate exists, the solver falls back to the first-order minimum; index zero returned by an all-masked reduction is never treated as a valid candidate
+
+    (5) Analytic pair subproblem: every update uses:
+
+        $alpha_i'=alpha_i+y_i*s , alpha_j'=alpha_j-y_j*s$
+        αᵢ′ = αᵢ+yᵢs, αⱼ′ = αⱼ−yⱼs
+
+        Therefore $y_i*Delta_alpha_i+y_j*Delta_alpha_j=0$ (yᵢΔαᵢ+yⱼΔαⱼ = 0) exactly in the mathematical parameterization. The one-dimensional objective has curvature eta_ij and unconstrained minimizer:
+
+        $s_unc=(y_j*g_j-y_i*g_i)/max(eta_ij,tau)$
+        s_unc = (yⱼgⱼ−yᵢgᵢ)/max(ηᵢⱼ,τ)
+
+        Both box constraints are converted into one interval [s_min,s_max], and $s=clip(s_unc,s_min,s_max)$ (s = clip(s_unc,s_min,s_max)) gives the exact clipped quadratic step. This unified expression covers same-label and opposite-label pairs; tau protects duplicate samples and near-zero curvature
+
+    (6) Bias recovery with a consistent sign: let $r=K@(alpha*y)$ (r = K(α ⊙ y)). A free support vector 0<alpha_i<C satisfies $y_i*(r_i+b)=1$ (yᵢ(rᵢ+b) = 1), hence:
+
+        $b=y_i-r_i$
+        b = yᵢ−rᵢ
+
+        The implementation averages y-r over all free support vectors. If none exists, it uses $b=(m+M)/2$ (b = (m+M)/2) from the final KKT interval. This sign is required by f=K_test@dual_coef+b; using mean(r-y) or -(m+M)/2 would be inconsistent with that decision function
+
+    (7) Multiclass decomposition and sparse inference: for L sorted observed classes, OvO trains L(L-1)/2 binary models. Each pair uses only its own samples and the corresponding kernel submatrix. A test sample receives one vote from each pair; score>=0 votes for class_a and score<0 votes for class_b. Ties select the first sorted class
+
+        OvR trains L binary models, each using all samples and the same complete K. Inference returns the class with the largest decision value. In either strategy, only the test-by-support matrix $K_test in R^(m*s)$ (K_test ∈ R^(m×s)) is required:
+
+        $f=K_test@dual_coef+b$
+        f = K_test·dual_coef+b
+
+        Complete dual vectors are concatenated in deterministic binary-task order. dual_offsets and sample_indices preserve the mapping even when OvO tasks have different sizes. Support-vector pruning occurs outside the compiled loop; support_tolerance=0 retains all nonzero coefficients
+
+    (8) Why precomputed-K second-order SMO: this design chooses exact dual optimization, static JAX shapes and transparent numerical checks rather than universal scalability:
+
+        ============================  ============================================  ==========================================
+        Method                        Main property                                 Typical scenario
+        ============================  ============================================  ==========================================
+        LIBSVM / scikit-learn         Mature exact solver and dynamic kernel cache  General production classification
+        Complete Q + SMO              Direct row access, simple prototype           Small teaching examples
+        Generic QP / interior point   General convex formulation                    Small special constrained problems
+        Nystrom / random features     Lower memory through approximation            K too large for memory
+        Precomputed K + JAX SMO       Exact dual, no Q, compiled device iteration   This small/medium dense component
+        ============================  ============================================  ==========================================
+
+        A float64 K uses approximately 8*n^2 bytes, about 800 MB when n=10000, before temporary arrays and backend workspaces. Different binary shapes can trigger separate JIT compilations
+
+    Algorithm flow
+    --------------
+    .. code-block:: text
+
+        Input A(n×p), integer b(n,), C, gamma, strategy and solver controls
+            |
+            v
+        Validate finite inputs, at least two classes and hyperparameters
+            |
+            v
+        Precompute RBF K(n,n) once
+            |
+            +------------> OvO: class pairs + kernel submatrices
+            |
+            +------------> OvR: class versus rest + shared complete K
+            |
+            v
+        Initialize alpha=0, grad=-1, iteration=0, m=+inf, M=-inf
+            |
+            v
+        Fixed-shape compiled SMO loop
+            |
+            +--> KKT masks -> first index -> second-order candidate or fallback
+            |
+            +--> Analytic pair step -> box clipping -> O(n) gradient update
+            |
+            +--> Stop at m-M<=tolerance or max_iterations
+            |
+            v
+        One device-to-host transfer per binary task
+            |
+            v
+        Recover b=y-r or (m+M)/2 -> independently verify dual diagnostics
+            |
+            v
+        Compress support vectors -> concatenate complete alpha segments
+            |
+            v
+        Inference: K_test(m,s) -> OvO votes or OvR maximum score
+            |
+            v
+        Return original integer class labels as int32
+
+    Step 1 (validation): require a finite two-dimensional A, finite integer labels b, matching sample counts, at least two observations, at least one feature and at least two observed classes. Validate all solver controls before JIT calls
+
+    Step 2 (kernel and task generation): compute one complete training kernel. OvO extracts pair-specific row/column blocks; OvR reuses the complete matrix. Every task maps its internal labels to {-1,+1}
+
+    Step 3 (compiled binary optimization): initialize a fixed-shape NamedTuple and execute KKT evaluation, second-order selection, exact pair updates, gradient maintenance and stopping through lax.while_loop. No Python host dispatch occurs per pair update
+
+    Step 4 (host verification and compression): retrieve each final state once, reject non-finite results, recover the correctly signed bias, independently recompute the gradient and measure equality, box and KKT residuals. Preserve honest per-task and aggregate convergence states
+
+    Step 5 (model assembly): retain support vectors and alpha*y coefficients for inference, and store complete alpha segments with offsets for diagnostics. Do not confuse global training indices with task-local dual positions
+
+    Step 6 (multiclass inference): compute only test-to-support kernels. OvO accumulates votes with deterministic zero-score and tie rules; OvR takes row-wise argmax over decision values. Neither route re-runs training or creates probabilities
+
+    JAX unique advantages
+    ---------------------
+    (1) Fully compiled device-side iteration: work-set selection, analytic updates and convergence checks execute inside one jax.jit-compiled lax.while_loop. The loop body is compiled once rather than unrolled max_iterations times, avoiding host synchronization on every SMO update
+
+    (2) Fixed-shape functional state: _SMOSVMState is a NamedTuple PyTree with stable shapes and dtypes. Dynamic support-set compression and free-support bias selection remain outside the compiled loop, while .at[index].add(...) provides immutable array updates
+
+    (3) Vectorized matrix computation: pairwise distances, candidate curvature, second-order scores and sparse decision functions use matrix products, broadcasting and masked reductions rather than Python sample or candidate loops
+
+    (4) Shared binary solver across multiclass strategies: OvO and OvR differ only in static task construction and inference composition. The same JIT binary kernel is reused, with shape-specific compilation when pair sizes differ
+
+    (5) Reproducible and independently checkable numerics: deterministic task order and float64 reference calculations support repeatable results in the reference environment. Independent gradient, equality, box and KKT checks are stronger correctness evidence than accuracy alone
+
+    (6) Backend migration with explicit limits: the same array program can target supported JAX backends. SMO remains a serial active-set method, so GPU execution is not automatically faster than CPU execution. Cross-version and cross-backend bitwise identity and iteration counts are not promised
+
+    (7) Composability without unsupported differentiation claims: kernel and sparse inference functions can be composed with other JAX array programs. Differentiating through data-dependent working-set indices and while-loop trip counts is not presented as an efficient hyperparameter-training strategy
+
+    Precautions
+    -----------
+    (1) This is multiclass C-SVM, not SVR: do not substitute compact SVR dual variables, epsilon-insensitive KKT bounds or continuous-target inverse standardization
+
+    (2) Kernel memory is a hard constraint: when complete K cannot fit in memory, use a dynamic-cache, linear or approximate method rather than relying on JIT alone
+
+    (3) Reaching max_iterations is not convergence: inspect per-task converged and kkt_violation together with the aggregate state. Finite alpha values alone do not prove optimality
+
+    (4) Empty-candidate fallback and curvature protection are required: masked argmin can return index zero even when no candidate is valid, and duplicate samples can make pair curvature zero
+
+    (5) Bias signs must match the decision function: free supports use b=y-r and the no-free-support fallback uses b=(m+M)/2. Independent tests protect both branches
+
+    (6) Decision values are not probabilities: OvO votes and OvR scores require separate calibration before any probabilistic interpretation; calibration is outside this component
+
+    (7) Preprocessing is a caller responsibility: RBF distances are scale-sensitive. If standardization is used, estimate statistics on training data only and reuse exactly the same transformation during inference
+
+    (8) Support pruning can be approximate: support_tolerance>0 discards small nonzero coefficients and can slightly alter scores. Compare full and sparse decisions for sensitive applications
+
+    (9) Preserve index semantics: alpha_hat is concatenated by binary task, dual_offsets locates each segment, and sample_indices maps that segment back to global training observations
+
+    (10) Static shapes affect compilation: different OvO pair sizes and new test shapes can trigger recompilation. Dynamic shrinking, LRU caches and Python host loops are deliberately outside this implementation
+
+    (11) OvO tie handling is deterministic but simple: this component selects the first sorted class. Decision-value aggregation or LIBSVM-style tie rules would be a different inference policy
+
+    (12) Hyperparameters still require model selection: C, gamma and tolerance affect accuracy, support counts and convergence. SMO only solves the dual for supplied values and does not replace validation
+
+    (13) Accuracy is not a sufficient correctness proof: retain independent kernel, pair-subproblem, analytic-dual, bias-sign, KKT, equality, box, gradient and sparse-decision checks
+
+    (14) Production model management is outside scope: string-label encoding, serialization, sample weights, calibration, automatic cross-validation and monitoring require an application layer
+
+    :example:
+        >>> import jax.numpy as jnp
+        >>> from statjax.regression import SMOMulticlassSVMComponent
+        >>> A = jnp.array([[-2.0,-2.0],[-2.2,-1.8],[2.0,-2.0],[2.2,-1.8],[0.0,2.2],[0.2,2.0]],dtype=jnp.float64)
+        >>> b = jnp.array([0,0,1,1,2,2],dtype=jnp.int32)
+        >>> # Train the same three-class task with both supported decompositions
+        >>> for strategy in ("ovo","ovr"):
+        ...     component = SMOMulticlassSVMComponent(C=2.0,gamma=0.5,strategy=strategy)
+        ...     alpha_hat,metrics = component.train(A=A,b=b)
+        ...     y_pred = component.reasoning(A_test=A[:3])
+        ...     converged = metrics["converged"]
+
+    :reference:
+        - [Support vector machine](https://en.wikipedia.org/wiki/Support_vector_machine)
+        - [Sequential minimal optimization](https://en.wikipedia.org/wiki/Sequential_minimal_optimization)
+        - [Radial basis function kernel](https://en.wikipedia.org/wiki/Radial_basis_function_kernel)
+        - [Karush-Kuhn-Tucker conditions](https://en.wikipedia.org/wiki/Karush%E2%80%93Kuhn%E2%80%93Tucker_conditions)
+        - StatJAX009 Multiclass SVM Design Document `"StatJAX009 Multiclass SVM SH V001"<https://github.com/redblue0216/statjax>`_
+    '''
+
+    def __init__(self,C=1.0,gamma=0.5,strategy="ovo",tolerance=1e-3,max_iterations=10000,curvature_tolerance=1e-12,support_tolerance=1e-10):
+        '''Attribute Function:
+
+            Initialize multiclass C-SVM hyperparameters and untrained model state
+
+        :parameters:
+            - C (float) - Positive box-constraint bound
+            - gamma (float) - Positive RBF kernel scale
+            - strategy (str) - Multiclass decomposition, either ovo or ovr
+            - tolerance (float) - Positive KKT stopping tolerance
+            - max_iterations (int) - Positive pair-update budget per binary task
+            - curvature_tolerance (float) - Positive curvature floor
+            - support_tolerance (float) - Non-negative support-vector pruning threshold
+        '''
+
+        if strategy not in ("ovo","ovr"):
+            raise ValueError("strategy must be 'ovo' or 'ovr'")
+        parameters = {
+            "C": (C,False),
+            "gamma": (gamma,False),
+            "tolerance": (tolerance,False),
+            "curvature_tolerance": (curvature_tolerance,False),
+            "support_tolerance": (support_tolerance,True)
+        }
+        validated = {}
+        for name,(value,allow_zero) in parameters.items():
+            if (
+                isinstance(value,(bool,np.bool_))
+                or not isinstance(value,(int,float,np.integer,np.floating))
+            ):
+                raise ValueError(f"{name} must be a finite real number")
+            value = float(value)
+            valid_range = value >= 0.0 if allow_zero else value > 0.0
+            if not np.isfinite(value) or not valid_range:
+                comparison = "non-negative" if allow_zero else "positive"
+                raise ValueError(f"{name} must be finite and {comparison}")
+            validated[name] = value
+        if (
+            not isinstance(max_iterations,int)
+            or isinstance(max_iterations,(bool,np.bool_))
+            or max_iterations < 1
+        ):
+            raise ValueError("max_iterations must be a positive integer")
+
+        ### Static optimization, kernel and support-pruning controls
+        self.C = validated["C"]
+        self.gamma = validated["gamma"]
+        self.strategy = strategy
+        self.tolerance = validated["tolerance"]
+        self.max_iterations = max_iterations
+        self.curvature_tolerance = validated["curvature_tolerance"]
+        self.support_tolerance = validated["support_tolerance"]
+        ### None means no complete dual or sparse binary model has been trained yet
+        self.alpha_hat = None
+        self.classes = None
+        self.binary_models = None
+        ### Segment boundaries map concatenated alpha to deterministic binary tasks
+        self.dual_offsets = None
+        self.n_features = None
+        self.metrics = None
+
+
+    def train(self,A,b):
+        '''Method Function:
+
+            Train an exact RBF multiclass C-SVM through OvO or OvR binary SMO tasks
+
+        :parameters:
+            - A (jnp.ndarray) - (n,p) Training feature matrix
+            - b (jnp.ndarray) - (n,) Integer class labels with at least two observed classes
+
+        :return:
+            - alpha_hat (jnp.ndarray) - Concatenated complete binary dual variables in task order
+            - metrics (dict) - Aggregate and per-binary convergence and numerical diagnostics
+        '''
+
+        ### Validate shape, finiteness and integer class semantics before compiling numerical functions
+        A = jnp.asarray(A,dtype=jnp.float64)
+        b_values = jnp.asarray(b,dtype=jnp.float64)
+        if A.ndim != 2 or b_values.ndim != 1 or A.shape[0] != b_values.shape[0]:
+            raise ValueError("A must have shape (n,p), b must have shape (n,), and their sample counts must match")
+        if A.shape[0] < 2 or A.shape[1] == 0:
+            raise ValueError("A and b must contain at least two samples and A must contain at least one feature")
+        if not bool(jnp.all(jnp.isfinite(A))) or not bool(jnp.all(jnp.isfinite(b_values))):
+            raise ValueError("A and b must contain only finite values")
+        if not bool(jnp.all(b_values == jnp.trunc(b_values))):
+            raise ValueError("b must contain integer class labels")
+
+        int32_info = np.iinfo(np.int32)
+        if not bool(jnp.all((b_values >= int32_info.min) & (b_values <= int32_info.max))):
+            raise ValueError("b must contain class labels representable as int32")
+        classes = np.unique(np.asarray(b_values,dtype=np.float64))
+        if classes.size < 2:
+            raise ValueError("b must contain at least two observed classes")
+        classes = classes.astype(np.int64)
+        b = b_values.astype(jnp.int32)
+
+        result = _fit_smo_multiclass_svm(
+            A,b,classes,self.C,self.gamma,self.strategy,self.tolerance,
+            self.max_iterations,self.curvature_tolerance,self.support_tolerance
+        )
+        self.alpha_hat = result["alpha_hat"]
+        self.classes = result["classes"]
+        self.binary_models = result["binary_models"]
+        self.dual_offsets = result["dual_offsets"]
+        self.n_features = A.shape[1]
+        self.metrics = result["metrics"]
+
+        return self.alpha_hat,self.metrics
+
+
+    def reasoning(self,A_test):
+        '''Method Function:
+
+            Predict integer classes by OvO voting or OvR maximum decision values
+
+        :parameters:
+            - A_test (jnp.ndarray) - (m,p) Test feature matrix with the training feature dimension
+
+        :return:
+            - y_pred (jnp.ndarray) - (m,) Predicted int32 class labels
+        '''
+
+        if self.alpha_hat is None:
+            raise RuntimeError("SMOMulticlassSVMComponent has not been trained yet, please call the train method first")
+        A_test = jnp.asarray(A_test,dtype=jnp.float64)
+        if A_test.ndim != 2 or A_test.shape[1] != self.n_features:
+            raise ValueError("A_test must have shape (m,p) with the same feature dimension as training data")
+        if A_test.shape[0] == 0:
+            raise ValueError("A_test must be non-empty")
+        if not bool(jnp.all(jnp.isfinite(A_test))):
+            raise ValueError("A_test must contain only finite values")
+
+        scores = [
+            _predict_binary_svm(
+                A_test,model["support_vectors"],model["dual_coef"],
+                model["intercept"],self.gamma
+            )
+            for model in self.binary_models
+        ]
+        if self.strategy == "ovr":
+            decision_values = jnp.stack(scores,axis=1)
+            return self.classes[jnp.argmax(decision_values,axis=1)].astype(jnp.int32)
+
+        votes = jnp.zeros((A_test.shape[0],len(self.classes)),dtype=jnp.int32)
+        class_to_column = {int(value): index for index,value in enumerate(np.asarray(self.classes))}
+        for model,score in zip(self.binary_models,scores):
+            column_a = class_to_column[model["class_a"]]
+            column_b = class_to_column[model["class_b"]]
+            votes = votes.at[score >= 0,column_a].add(1)
+            votes = votes.at[score < 0,column_b].add(1)
+
+        return self.classes[jnp.argmax(votes,axis=1)].astype(jnp.int32)
+
+
+    def _info(self):
+        '''Method Function:
+
+            Return component metadata
+
+        :parameters:
+            nothing
+
+        :return:
+            - info (str) - Text introduction of the component
+        '''
+
+        return "SMOMulticlassSVMComponent: exact RBF multiclass C-SVM component based on OvO/OvR decomposition and second-order SMO, implemented with the JAX technology stack"
 
 
 

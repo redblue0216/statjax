@@ -26,14 +26,14 @@ This is the public class interface of the regression module. It exposes independ
 
 - Main functions:
 
-    (1) Open OLS, ridge, LASSO, binary Logistic, binary Probit, multinomial Logistic, multinomial Probit and RBF support vector regression components
+    (1) Open OLS, ridge, LASSO, binary Logistic, binary Probit, multinomial Logistic, multinomial Probit, RBF support vector regression and RBF multiclass C-SVM components
 
 Usage examples
 --------------
 .. code-block:: python
     :linenos:
 
-    from statjax.regression import HouseholderOLSComponent,SVDRidgeComponent,CDLassoComponent,QRLogisticComponent,QRProbitComponent,QRMultinomialLogisticComponent,GHKMultinomialProbitComponent,SMOSVRComponent
+    from statjax.regression import HouseholderOLSComponent,SVDRidgeComponent,CDLassoComponent,QRLogisticComponent,QRProbitComponent,QRMultinomialLogisticComponent,GHKMultinomialProbitComponent,SMOSVRComponent,SMOMulticlassSVMComponent
 
     ols_instance = HouseholderOLSComponent()
     x_hat,metrics = ols_instance.train(A=A_train,b=b_train)
@@ -78,6 +78,12 @@ Usage examples
     beta_hat,metrics = svr_instance.train(A=A_svr_train,b=b_svr_train)
     y_pred = svr_instance.reasoning(A_test=A_svr_test)
 
+    ### Multiclass C-SVM uses binary duals rather than the compact SVR dual
+    svm_instance = SMOMulticlassSVMComponent(C=2.0,gamma=0.5,strategy="ovo")
+    alpha_hat,metrics = svm_instance.train(A=A_multiclass_train,b=b_multiclass_train)
+    ### Return original integer classes through OvO votes or OvR maximum scores
+    class_pred = svm_instance.reasoning(A_test=A_multiclass_test)
+
 Class Description
 -----------------
 (1)TestRegression: This is a regression test placeholder component implementation class, the main function is to verify the framework link, the main technical inheritance
@@ -98,6 +104,8 @@ Class Description
 
 (9)SMOSVRComponent: This is an RBF support vector regression component based on compact-dual second-order SMO, exact pair subproblems, KKT diagnostics and sparse support-vector inference
 
+(10)SMOMulticlassSVMComponent: This is an exact RBF multiclass C-SVM component based on OvO/OvR decomposition, second-order SMO, analytic pair updates, correctly signed bias recovery and sparse class inference
+
 References
 ----------
 StatJAX Design Document `"StatJAX Design SH V001"<https://github.com/redblue0216/statjax>`_
@@ -112,6 +120,8 @@ StatJAX007 Multinomial Probit Design Document `"StatJAX007 Multinomial Probit SH
 
 StatJAX008 Support Vector Regression Design Document `"StatJAX008 SVM SH V001"<https://github.com/redblue0216/statjax>`_
 
+StatJAX009 Multiclass C-SVM Design Document `"StatJAX009 Multiclass SVM SH V001"<https://github.com/redblue0216/statjax>`_
+
 '''
 
 
@@ -124,7 +134,7 @@ StatJAX008 Support Vector Regression Design Document `"StatJAX008 SVM SH V001"<h
 ### Basic package
 ### Algorithm package
 ### Project Package - Algorithm Components
-from statjax.regression._components import TestRegression,HouseholderOLSComponent,SVDRidgeComponent,CDLassoComponent,QRLogisticComponent,QRProbitComponent,QRMultinomialLogisticComponent,GHKMultinomialProbitComponent,SMOSVRComponent
+from statjax.regression._components import TestRegression,HouseholderOLSComponent,SVDRidgeComponent,CDLassoComponent,QRLogisticComponent,QRProbitComponent,QRMultinomialLogisticComponent,GHKMultinomialProbitComponent,SMOSVRComponent,SMOMulticlassSVMComponent
 
 
 
@@ -140,6 +150,7 @@ from statjax.regression._components import TestRegression,HouseholderOLSComponen
 ### ------QRMultinomialLogisticComponent
 ### ------GHKMultinomialProbitComponent
 ### ------SMOSVRComponent
+### ------SMOMulticlassSVMComponent
 ###
 ################################################################################################################################################################################
 
@@ -159,7 +170,8 @@ __all__ = [
     "QRProbitComponent",
     "QRMultinomialLogisticComponent",
     "GHKMultinomialProbitComponent",
-    "SMOSVRComponent"
+    "SMOSVRComponent",
+    "SMOMulticlassSVMComponent"
 ]
 
 
